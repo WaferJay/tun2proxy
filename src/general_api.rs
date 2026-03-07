@@ -1,8 +1,10 @@
 use crate::{
     ArgVerbosity, Args,
     args::{ArgDns, ArgProxy},
+    proxy_handler::ProxyHandlerManager,
 };
 use std::os::raw::{c_char, c_int, c_ushort};
+use std::sync::Arc;
 
 /// # Safety
 ///
@@ -131,7 +133,7 @@ pub fn general_run_for_api(args: Args, tun_mtu: u16, packet_information: bool) -
     };
     let args_clone = args.clone();
     let res = rt.block_on(async move {
-        let ret = general_run_async(args_clone, tun_mtu, packet_information, shutdown_token).await;
+        let ret = general_run_async(args_clone, tun_mtu, packet_information, shutdown_token, None).await;
         // Spawn a std thread to force exit after timeout so it isn't cancelled
         // when the tokio runtime is dropped.
         let _h = std::thread::spawn(move || {
@@ -168,6 +170,7 @@ pub async fn general_run_async(
     tun_mtu: u16,
     _packet_information: bool,
     shutdown_token: tokio_util::sync::CancellationToken,
+    proxy_handler_manager: Option<Arc<dyn ProxyHandlerManager>>,
 ) -> std::io::Result<usize> {
     let mut tun_config = tun::Configuration::default();
 
@@ -259,7 +262,7 @@ pub async fn general_run_async(
         }
     }
 
-    let join_handle = tokio::spawn(crate::run(device, tun_mtu, args.clone(), shutdown_token.clone()));
+    let join_handle = tokio::spawn(crate::run(device, tun_mtu, args.clone(), shutdown_token.clone(), proxy_handler_manager));
 
     match join_handle.await? {
         Ok(sessions) => {

@@ -6,7 +6,7 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::Mutex;
 
 #[async_trait::async_trait]
-pub(crate) trait ProxyHandler: Send + Sync {
+pub trait ProxyHandler: Send + Sync {
     fn get_server_addr(&self) -> SocketAddr;
     fn get_session_info(&self) -> SessionInfo;
     fn get_domain_name(&self) -> Option<String>;
@@ -22,7 +22,7 @@ pub(crate) trait ProxyHandler: Send + Sync {
 }
 
 #[async_trait::async_trait]
-pub(crate) trait ProxyHandlerManager: Send + Sync {
+pub trait ProxyHandlerManager: Send + Sync {
     async fn new_proxy_handler(
         &self,
         info: SessionInfo,

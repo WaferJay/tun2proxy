@@ -2,7 +2,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 #[allow(dead_code)]
 #[derive(Hash, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Debug, Default)]
-pub(crate) enum IpProtocol {
+pub enum IpProtocol {
     #[default]
     Tcp,
     Udp,
@@ -22,7 +22,7 @@ impl std::fmt::Display for IpProtocol {
 }
 
 #[derive(Hash, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Debug)]
-pub(crate) struct SessionInfo {
+pub struct SessionInfo {
     pub(crate) src: SocketAddr,
     pub(crate) dst: SocketAddr,
     pub(crate) protocol: IpProtocol,

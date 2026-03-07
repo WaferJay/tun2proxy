@@ -2,14 +2,13 @@
 use crate::udpgw::UdpGwClient;
 use crate::{
     directions::{IncomingDataEvent, IncomingDirection, OutgoingDirection},
-    http::{HttpAuthenticator, HttpManager, PasswordAuthenticator},
     no_proxy::NoProxyManager,
     session_info::{IpProtocol, SessionInfo},
     virtual_dns::VirtualDns,
 };
 pub use clap::ValueEnum;
 use ipstack::{IpStackStream, IpStackTcpStream, IpStackUdpStream};
-use proxy_handler::{ProxyHandler, ProxyHandlerManager};
+use proxy_handler::ProxyHandler;
 use socks::SocksProxyManager;
 pub use socks5_impl::protocol::UserKey;
 #[cfg(feature = "udpgw")]
@@ -35,6 +34,8 @@ use udpgw::{UDPGW_KEEPALIVE_TIME, UDPGW_MAX_CONNECTIONS, UdpGwClientStream, UdpG
 pub use {
     args::{ArgDns, ArgProxy, ArgVerbosity, Args, ProxyType},
     error::{BoxError, Error, Result},
+    http::{HttpAuthenticator, HttpManager, PasswordAuthenticator},
+    proxy_handler::ProxyHandlerManager,
     traffic_status::{TrafficStatus, tun2proxy_set_traffic_status_callback},
 };
 
@@ -157,7 +158,13 @@ async fn create_udp_stream(socket_queue: &Option<Arc<SocketQueue>>, peer: Socket
 /// * `shutdown_token` - The token to exit the server
 /// # Returns
 /// * The number of sessions while exiting
-pub async fn run<D>(device: D, mtu: u16, args: Args, shutdown_token: CancellationToken) -> crate::Result<usize>
+pub async fn run<D>(
+    device: D,
+    mtu: u16,
+    args: Args,
+    shutdown_token: CancellationToken,
+    proxy_handler_manager: Option<Arc<dyn ProxyHandlerManager>>,
+) -> crate::Result<usize>
 where
     D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -224,17 +231,22 @@ where
     #[cfg(not(target_os = "linux"))]
     let socket_queue = None;
 
-    use socks5_impl::protocol::Version::{V4, V5};
-    let mgr: Arc<dyn ProxyHandlerManager> = match args.proxy.proxy_type {
-        ProxyType::Socks5 => Arc::new(SocksProxyManager::new(server_addr, V5, key)),
-        ProxyType::Socks4 => Arc::new(SocksProxyManager::new(server_addr, V4, key)),
-        ProxyType::Http => {
-            let authenticator: Option<Arc<dyn HttpAuthenticator>> = key.map(|credentials| {
-                Arc::new(PasswordAuthenticator::new(credentials)) as Arc<dyn HttpAuthenticator>
-            });
-            Arc::new(HttpManager::new(server_addr, authenticator))
+    let mgr: Arc<dyn ProxyHandlerManager> = match proxy_handler_manager {
+        Some(m) => m,
+        None => {
+            use socks5_impl::protocol::Version::{V4, V5};
+            match args.proxy.proxy_type {
+                ProxyType::Socks5 => Arc::new(SocksProxyManager::new(server_addr, V5, key)),
+                ProxyType::Socks4 => Arc::new(SocksProxyManager::new(server_addr, V4, key)),
+                ProxyType::Http => {
+                    let authenticator: Option<Arc<dyn HttpAuthenticator>> = key.map(|credentials| {
+                        Arc::new(PasswordAuthenticator::new(credentials)) as Arc<dyn HttpAuthenticator>
+                    });
+                    Arc::new(HttpManager::new(server_addr, authenticator))
+                }
+                ProxyType::None => Arc::new(NoProxyManager::new()),
+            }
         }
-        ProxyType::None => Arc::new(NoProxyManager::new()),
     };
 
     let mut ipstack_config = ipstack::IpStackConfig::default();

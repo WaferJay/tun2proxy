@@ -1,13 +1,13 @@
 #![allow(dead_code)]
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
-pub(crate) enum IncomingDirection {
+pub enum IncomingDirection {
     FromServer,
     FromClient,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
-pub(crate) enum OutgoingDirection {
+pub enum OutgoingDirection {
     ToServer,
     ToClient,
 }
@@ -19,10 +19,10 @@ pub(crate) enum Direction {
 }
 
 #[derive(Clone, Eq, PartialEq, Debug)]
-pub(crate) struct DataEvent<'a, T> {
+pub struct DataEvent<'a, T> {
     pub(crate) direction: T,
     pub(crate) buffer: &'a [u8],
 }
 
-pub(crate) type IncomingDataEvent<'a> = DataEvent<'a, IncomingDirection>;
-pub(crate) type OutgoingDataEvent<'a> = DataEvent<'a, OutgoingDirection>;
+pub type IncomingDataEvent<'a> = DataEvent<'a, IncomingDirection>;
+pub type OutgoingDataEvent<'a> = DataEvent<'a, OutgoingDirection>;

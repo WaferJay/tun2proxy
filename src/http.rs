@@ -14,7 +14,7 @@ use unicase::UniCase;
 
 pub(crate) type DigestState = digest_auth::WwwAuthenticateHeader;
 
-pub(crate) enum AuthResult {
+pub enum AuthResult {
     /// This authenticator does not handle the response.
     Unhandled,
     /// Handled – retry with the current authenticator (e.g. Digest stale nonce refresh).
@@ -24,7 +24,7 @@ pub(crate) enum AuthResult {
 }
 
 #[async_trait::async_trait]
-pub(crate) trait HttpAuthenticator: Send + Sync {
+pub trait HttpAuthenticator: Send + Sync {
     /// Generate authentication request headers, returning `(name, value)` pairs.
     async fn generate_auth_headers(&self, uri: &str) -> Result<Vec<(String, String)>>;
 
@@ -38,7 +38,7 @@ pub(crate) trait HttpAuthenticator: Send + Sync {
     ) -> Result<AuthResult>;
 }
 
-pub(crate) struct BasicPasswordAuthenticator {
+pub struct BasicPasswordAuthenticator {
     credentials: UserKey,
     digest_state: Arc<Mutex<Option<DigestState>>>,
 }
@@ -54,7 +54,7 @@ impl BasicPasswordAuthenticator {
 
 /// Alias for `BasicPasswordAuthenticator` – the standard password authenticator
 /// that starts with Basic and automatically upgrades to Digest when challenged.
-pub(crate) type PasswordAuthenticator = BasicPasswordAuthenticator;
+pub type PasswordAuthenticator = BasicPasswordAuthenticator;
 
 #[async_trait::async_trait]
 impl HttpAuthenticator for BasicPasswordAuthenticator {
@@ -487,7 +487,7 @@ impl ProxyHandler for HttpConnection {
     }
 }
 
-pub(crate) struct HttpManager {
+pub struct HttpManager {
     server: SocketAddr,
     authenticator: Arc<Mutex<Option<Arc<dyn HttpAuthenticator>>>>,
 }
