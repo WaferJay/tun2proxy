@@ -2,7 +2,7 @@
 use crate::udpgw::UdpGwClient;
 use crate::{
     directions::{IncomingDataEvent, IncomingDirection, OutgoingDirection},
-    http::HttpManager,
+    http::{HttpAuthenticator, HttpManager, PasswordAuthenticator},
     no_proxy::NoProxyManager,
     session_info::{IpProtocol, SessionInfo},
     virtual_dns::VirtualDns,
@@ -228,7 +228,12 @@ where
     let mgr: Arc<dyn ProxyHandlerManager> = match args.proxy.proxy_type {
         ProxyType::Socks5 => Arc::new(SocksProxyManager::new(server_addr, V5, key)),
         ProxyType::Socks4 => Arc::new(SocksProxyManager::new(server_addr, V4, key)),
-        ProxyType::Http => Arc::new(HttpManager::new(server_addr, key)),
+        ProxyType::Http => {
+            let authenticator: Option<Arc<dyn HttpAuthenticator>> = key.map(|credentials| {
+                Arc::new(PasswordAuthenticator::new(credentials)) as Arc<dyn HttpAuthenticator>
+            });
+            Arc::new(HttpManager::new(server_addr, authenticator))
+        }
         ProxyType::None => Arc::new(NoProxyManager::new()),
     };
 

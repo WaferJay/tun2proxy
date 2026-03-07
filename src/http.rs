@@ -6,22 +6,151 @@ use crate::{
 };
 use httparse::Response;
 use socks5_impl::protocol::UserKey;
-use std::{
-    collections::{HashMap, VecDeque, hash_map::RandomState},
-    iter::FromIterator,
-    net::SocketAddr,
-    str,
-    sync::Arc,
-};
+use std::{collections::VecDeque, net::SocketAddr, str, sync::Arc};
+use std::collections::HashMap;
+use std::hash::RandomState;
 use tokio::sync::Mutex;
 use unicase::UniCase;
 
-#[derive(Eq, PartialEq, Debug)]
-#[allow(dead_code)]
-enum AuthenticationScheme {
-    None,
-    Basic,
-    Digest,
+pub(crate) type DigestState = digest_auth::WwwAuthenticateHeader;
+
+pub(crate) enum AuthResult {
+    /// This authenticator does not handle the response.
+    Unhandled,
+    /// Handled – retry with the current authenticator (e.g. Digest stale nonce refresh).
+    Retry,
+    /// Handled – replace the authenticator and retry (e.g. Basic → Digest upgrade).
+    Switch(Arc<dyn HttpAuthenticator>),
+}
+
+#[async_trait::async_trait]
+pub(crate) trait HttpAuthenticator: Send + Sync {
+    /// Generate authentication request headers, returning `(name, value)` pairs.
+    async fn generate_auth_headers(&self, uri: &str) -> Result<Vec<(String, String)>>;
+
+    /// Handle a non-200 response.
+    /// `is_retry` is `true` when auth has already been attempted on this connection.
+    async fn handle_response(
+        &self,
+        status_code: u16,
+        response_headers: &HashMap<UniCase<&str>, &[u8], RandomState>,
+        is_retry: bool,
+    ) -> Result<AuthResult>;
+}
+
+pub(crate) struct BasicPasswordAuthenticator {
+    credentials: UserKey,
+    digest_state: Arc<Mutex<Option<DigestState>>>,
+}
+
+impl BasicPasswordAuthenticator {
+    pub fn new(credentials: UserKey) -> Self {
+        Self {
+            credentials,
+            digest_state: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+/// Alias for `BasicPasswordAuthenticator` – the standard password authenticator
+/// that starts with Basic and automatically upgrades to Digest when challenged.
+pub(crate) type PasswordAuthenticator = BasicPasswordAuthenticator;
+
+#[async_trait::async_trait]
+impl HttpAuthenticator for BasicPasswordAuthenticator {
+    async fn generate_auth_headers(&self, _uri: &str) -> Result<Vec<(String, String)>> {
+        let auth_b64 =
+            base64easy::encode(self.credentials.to_string(), base64easy::EngineKind::Standard);
+        Ok(vec![(
+            PROXY_AUTHORIZATION.to_string(),
+            format!("Basic {auth_b64}"),
+        )])
+    }
+
+    async fn handle_response(
+        &self,
+        status_code: u16,
+        response_headers: &HashMap<UniCase<&str>, &[u8], RandomState>,
+        _is_retry: bool,
+    ) -> Result<AuthResult> {
+        if status_code != 407 {
+            return Ok(AuthResult::Unhandled);
+        }
+
+        let Some(auth_data) = response_headers.get(&UniCase::new(PROXY_AUTHENTICATE)) else {
+            return Err("Proxy requires auth but doesn't send its details".into());
+        };
+
+        if auth_data.len() < 6 || !auth_data[..6].eq_ignore_ascii_case(b"digest") {
+            return Err("Bad credentials".into());
+        }
+
+        // Parse the Digest challenge and store it in the shared state.
+        let data = str::from_utf8(auth_data)?;
+        let state = digest_auth::parse(data)?;
+        self.digest_state.lock().await.replace(state);
+
+        let digest_auth = Arc::new(DigestPasswordAuthenticator {
+            credentials: self.credentials.clone(),
+            digest_state: self.digest_state.clone(),
+        });
+        Ok(AuthResult::Switch(digest_auth))
+    }
+}
+
+pub(crate) struct DigestPasswordAuthenticator {
+    credentials: UserKey,
+    digest_state: Arc<Mutex<Option<DigestState>>>,
+}
+
+#[async_trait::async_trait]
+impl HttpAuthenticator for DigestPasswordAuthenticator {
+    async fn generate_auth_headers(&self, uri: &str) -> Result<Vec<(String, String)>> {
+        let context = digest_auth::AuthContext::new_with_method(
+            &self.credentials.username,
+            &self.credentials.password,
+            uri,
+            Option::<&'_ [u8]>::None,
+            digest_auth::HttpMethod::CONNECT,
+        );
+
+        let mut state = self.digest_state.lock().await;
+        let response = state
+            .as_mut()
+            .ok_or_else(|| Error::from("Digest state not initialized"))?
+            .respond(&context)
+            .map_err(|e| Error::from(e.to_string()))?;
+
+        Ok(vec![(
+            PROXY_AUTHORIZATION.to_string(),
+            response.to_header_string(),
+        )])
+    }
+
+    async fn handle_response(
+        &self,
+        status_code: u16,
+        response_headers: &HashMap<UniCase<&str>, &[u8], RandomState>,
+        is_retry: bool,
+    ) -> Result<AuthResult> {
+        if status_code != 407 {
+            return Ok(AuthResult::Unhandled);
+        }
+
+        let Some(auth_data) = response_headers.get(&UniCase::new(PROXY_AUTHENTICATE)) else {
+            return Err("Proxy requires auth but doesn't send its details".into());
+        };
+
+        let data = str::from_utf8(auth_data)?;
+        let state = digest_auth::parse(data)?;
+
+        if is_retry && !state.stale {
+            return Err("Bad credentials".into());
+        }
+
+        self.digest_state.lock().await.replace(state);
+        Ok(AuthResult::Retry)
+    }
 }
 
 #[derive(Eq, PartialEq, Debug)]
@@ -34,8 +163,6 @@ enum HttpState {
     Established,
 }
 
-pub(crate) type DigestState = digest_auth::WwwAuthenticateHeader;
-
 pub struct HttpConnection {
     server_addr: SocketAddr,
     state: HttpState,
@@ -46,9 +173,9 @@ pub struct HttpConnection {
     crlf_state: u8,
     counter: usize,
     skip: usize,
-    digest_state: Arc<Mutex<Option<DigestState>>>,
+    authenticator: Option<Arc<dyn HttpAuthenticator>>,
+    shared_auth: Arc<Mutex<Option<Arc<dyn HttpAuthenticator>>>>,
     before: bool,
-    credentials: Option<UserKey>,
     info: SessionInfo,
     domain_name: Option<String>,
 }
@@ -64,8 +191,8 @@ impl HttpConnection {
         server_addr: SocketAddr,
         info: SessionInfo,
         domain_name: Option<String>,
-        credentials: Option<UserKey>,
-        digest_state: Arc<Mutex<Option<DigestState>>>,
+        authenticator: Option<Arc<dyn HttpAuthenticator>>,
+        shared_auth: Arc<Mutex<Option<Arc<dyn HttpAuthenticator>>>>,
     ) -> Result<Self> {
         let mut res = Self {
             server_addr,
@@ -77,9 +204,9 @@ impl HttpConnection {
             skip: 0,
             counter: 0,
             crlf_state: 0,
-            digest_state,
+            authenticator,
+            shared_auth,
             before: false,
-            credentials,
             info,
             domain_name,
         };
@@ -101,52 +228,14 @@ impl HttpConnection {
         self.server_outbuf.extend(host.as_bytes());
         self.server_outbuf.extend(b"\r\n");
 
-        let scheme = if self.digest_state.lock().await.is_none() {
-            AuthenticationScheme::Basic
-        } else {
-            AuthenticationScheme::Digest
-        };
-        self.send_auth_data(scheme).await?;
-
-        self.server_outbuf.extend(b"\r\n");
-        Ok(())
-    }
-
-    async fn send_auth_data(&mut self, scheme: AuthenticationScheme) -> Result<()> {
-        let Some(credentials) = &self.credentials else {
-            return Ok(());
-        };
-
-        match scheme {
-            AuthenticationScheme::Digest => {
-                let uri = if let Some(domain_name) = &self.domain_name {
-                    format!("{}:{}", domain_name, self.info.dst.port())
-                } else {
-                    self.info.dst.to_string()
-                };
-
-                let context = digest_auth::AuthContext::new_with_method(
-                    &credentials.username,
-                    &credentials.password,
-                    &uri,
-                    Option::<&'_ [u8]>::None,
-                    digest_auth::HttpMethod::CONNECT,
-                );
-
-                let mut state = self.digest_state.lock().await;
-                let response = state.as_mut().unwrap().respond(&context).unwrap();
-
+        if let Some(auth) = &self.authenticator {
+            for (name, value) in auth.generate_auth_headers(&host).await? {
                 self.server_outbuf
-                    .extend(format!("{}: {}\r\n", PROXY_AUTHORIZATION, response.to_header_string()).as_bytes());
+                    .extend(format!("{name}: {value}\r\n").as_bytes());
             }
-            AuthenticationScheme::Basic => {
-                let auth_b64 = base64easy::encode(credentials.to_string(), base64easy::EngineKind::Standard);
-                self.server_outbuf
-                    .extend(format!("{PROXY_AUTHORIZATION}: Basic {auth_b64}\r\n").as_bytes());
-            }
-            AuthenticationScheme::None => {}
         }
 
+        self.server_outbuf.extend(b"\r\n");
         Ok(())
     }
 
@@ -178,18 +267,21 @@ impl HttpConnection {
                 self.crlf_state = 0;
 
                 let mut headers = [httparse::EMPTY_HEADER; 16];
-                let mut res = Response::new(&mut headers);
 
-                // First make the buffer contiguous
-                let slice = self.server_inbuf.make_contiguous();
-                let status = res.parse(slice)?;
-                if status.is_partial() {
-                    // TODO: Optimize in order to detect 200
-                    return Ok(());
-                }
-                let len = status.unwrap();
-                let status_code = res.code.unwrap();
-                let version = res.version.unwrap();
+                let (len, status_code, version, reason) = {
+                    let mut res = Response::new(&mut headers);
+                    let slice = self.server_inbuf.make_contiguous();
+                    let status = res.parse(slice)?;
+                    if status.is_partial() {
+                        return Ok(());
+                    }
+                    (
+                        status.unwrap(),
+                        res.code.unwrap(),
+                        res.version.unwrap(),
+                        res.reason.unwrap_or("").to_string(),
+                    )
+                };
 
                 if status_code == 200 {
                     // Connection successful
@@ -200,37 +292,33 @@ impl HttpConnection {
                     return Box::pin(self.state_change()).await;
                 }
 
-                if status_code != 407 {
-                    let e = format!(
-                        "Expected success status code. Server replied with {} [Reason: {}].",
-                        status_code,
-                        res.reason.unwrap()
-                    );
-                    return Err(e.into());
-                }
-
                 let headers_map: HashMap<UniCase<&str>, &[u8], RandomState> =
                     HashMap::from_iter(headers.map(|x| (UniCase::new(x.name), x.value)));
 
-                let Some(auth_data) = headers_map.get(&UniCase::new(PROXY_AUTHENTICATE)) else {
-                    return Err("Proxy requires auth but doesn't send it datails".into());
+                let auth = match &self.authenticator {
+                    Some(a) => a.clone(),
+                    None => {
+                        return Err(
+                            format!("HTTP {} [{}]", status_code, reason).into()
+                        );
+                    }
                 };
 
-                if !auth_data[..6].eq_ignore_ascii_case(b"digest") {
-                    // Fail to auth and the scheme isn't in the
-                    // supported auth method schemes
-                    return Err("Bad credentials".into());
+                match auth
+                    .handle_response(status_code, &headers_map, self.before)
+                    .await?
+                {
+                    AuthResult::Retry => { /* use current authenticator */ }
+                    AuthResult::Switch(new_auth) => {
+                        self.authenticator = Some(new_auth.clone());
+                        *self.shared_auth.lock().await = Some(new_auth);
+                    }
+                    AuthResult::Unhandled => {
+                        return Err(
+                            format!("HTTP {} [{}]", status_code, reason).into()
+                        );
+                    }
                 }
-
-                // Analize challenge params
-                let data = str::from_utf8(auth_data)?;
-                let state = digest_auth::parse(data)?;
-                if self.before && !state.stale {
-                    return Err("Bad credentials".into());
-                }
-
-                // Update the digest state
-                self.digest_state.lock().await.replace(state);
                 self.before = true;
 
                 let closed = match headers_map.get(&UniCase::new(CONNECTION)) {
@@ -401,8 +489,7 @@ impl ProxyHandler for HttpConnection {
 
 pub(crate) struct HttpManager {
     server: SocketAddr,
-    credentials: Option<UserKey>,
-    digest_state: Arc<Mutex<Option<DigestState>>>,
+    authenticator: Arc<Mutex<Option<Arc<dyn HttpAuthenticator>>>>,
 }
 
 #[async_trait::async_trait]
@@ -416,18 +503,25 @@ impl ProxyHandlerManager for HttpManager {
         if info.protocol != IpProtocol::Tcp {
             return Err(Error::from("Protocol not supported by HTTP proxy").into());
         }
+        let authenticator = self.authenticator.lock().await.clone();
         Ok(Arc::new(Mutex::new(
-            HttpConnection::new(self.server, info, domain_name, self.credentials.clone(), self.digest_state.clone()).await?,
+            HttpConnection::new(
+                self.server,
+                info,
+                domain_name,
+                authenticator,
+                self.authenticator.clone(),
+            )
+            .await?,
         )))
     }
 }
 
 impl HttpManager {
-    pub fn new(server: SocketAddr, credentials: Option<UserKey>) -> Self {
+    pub fn new(server: SocketAddr, authenticator: Option<Arc<dyn HttpAuthenticator>>) -> Self {
         Self {
             server,
-            credentials,
-            digest_state: Arc::new(Mutex::new(None)),
+            authenticator: Arc::new(Mutex::new(authenticator)),
         }
     }
 }
