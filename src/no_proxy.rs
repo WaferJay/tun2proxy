@@ -80,7 +80,7 @@ impl ProxyHandler for NoProxyHandler {
     }
 }
 
-pub(crate) struct NoProxyManager;
+pub struct NoProxyManager;
 
 #[async_trait::async_trait]
 impl ProxyHandlerManager for NoProxyManager {

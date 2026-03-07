@@ -1,6 +1,6 @@
 #[cfg(feature = "udpgw")]
 use crate::udpgw::UdpGwClient;
-use crate::{
+pub use crate::{
     directions::{IncomingDataEvent, IncomingDirection, OutgoingDirection},
     no_proxy::NoProxyManager,
     session_info::{IpProtocol, SessionInfo},
@@ -8,7 +8,7 @@ use crate::{
 };
 pub use clap::ValueEnum;
 use ipstack::{IpStackStream, IpStackTcpStream, IpStackUdpStream};
-use proxy_handler::ProxyHandler;
+pub use proxy_handler::ProxyHandler;
 use socks::SocksProxyManager;
 pub use socks5_impl::protocol::UserKey;
 #[cfg(feature = "udpgw")]
@@ -34,7 +34,7 @@ use udpgw::{UDPGW_KEEPALIVE_TIME, UDPGW_MAX_CONNECTIONS, UdpGwClientStream, UdpG
 pub use {
     args::{ArgDns, ArgProxy, ArgVerbosity, Args, ProxyType},
     error::{BoxError, Error, Result},
-    http::{HttpAuthenticator, HttpManager, PasswordAuthenticator},
+    http::{HttpAuthenticator, HttpManager, PasswordAuthenticator, AuthResult},
     proxy_handler::ProxyHandlerManager,
     traffic_status::{TrafficStatus, tun2proxy_set_traffic_status_callback},
 };
