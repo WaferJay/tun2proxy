@@ -1,11 +1,22 @@
 use hickory_proto::{
-    op::{Message, MessageType, ResponseCode},
+    op::{Message, MessageType, OpCode, Query, ResponseCode},
     rr::{
-        Name, RData, Record,
+        Name, RData, Record, RecordType,
         rdata::{A, AAAA},
     },
 };
 use std::{net::IpAddr, str::FromStr};
+
+pub fn build_dns_query(domain: &str, id: u16) -> Result<Vec<u8>, String> {
+    let mut msg = Message::new();
+    msg.set_id(id);
+    msg.set_message_type(MessageType::Query);
+    msg.set_op_code(OpCode::Query);
+    msg.set_recursion_desired(true);
+    let name = Name::from_str(domain).map_err(|e| e.to_string())?;
+    msg.add_query(Query::query(name, RecordType::A));
+    msg.to_vec().map_err(|e| e.to_string())
+}
 
 pub fn build_dns_response(mut request: Message, domain: &str, ip: IpAddr, ttl: u32) -> Result<Message, String> {
     let record = match ip {
@@ -50,6 +61,18 @@ pub fn extract_ipaddr_from_dns_message(message: &Message) -> Result<IpAddr, Stri
     Err(format!("{:?}", message.answers()))
 }
 
+pub fn extract_all_ipaddrs_from_dns_message(message: &Message) -> Vec<IpAddr> {
+    message
+        .answers()
+        .iter()
+        .filter_map(|answer| match answer.data() {
+            RData::A(addr) => Some(IpAddr::V4((*addr).into())),
+            RData::AAAA(addr) => Some(IpAddr::V6((*addr).into())),
+            _ => None,
+        })
+        .collect()
+}
+
 pub fn extract_domain_from_dns_message(message: &Message) -> Result<String, String> {
     let query = message.queries().first().ok_or("DnsRequest no query body")?;
     let name = query.name().to_string();
@@ -68,3 +91,7 @@ pub fn parse_data_to_dns_message(data: &[u8], used_by_tcp: bool) -> Result<Messa
     let message = Message::from_vec(data).map_err(|e| e.to_string())?;
     Ok(message)
 }
+
+#[cfg(test)]
+#[path = "dns_tests.rs"]
+mod tests;
