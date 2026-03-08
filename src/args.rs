@@ -104,6 +104,12 @@ pub struct Args {
     #[arg(short, long, value_name = "IP/CIDR")]
     pub bypass: Vec<IpCidr>,
 
+    /// Domains whose data connections should bypass the proxy and connect directly.
+    /// Uses suffix matching: "google.com" matches "www.google.com", "mail.google.com", etc.
+    /// e.g. --bypass-domain google.com --bypass-domain github.com
+    #[arg(long, value_name = "DOMAIN")]
+    pub bypass_domain: Vec<String>,
+
     /// TCP timeout in seconds
     #[arg(long, value_name = "seconds", default_value = "600")]
     pub tcp_timeout: u64,
@@ -181,6 +187,7 @@ impl Default for Args {
             dns: ArgDns::default(),
             dns_addr: "8.8.8.8".parse().unwrap(),
             bypass: vec![],
+            bypass_domain: vec![],
             tcp_timeout: 600,
             udp_timeout: 10,
             verbosity: ArgVerbosity::Info,

@@ -51,6 +51,7 @@ mod android;
 mod args;
 mod directions;
 mod dns;
+mod dns_mapping;
 mod dump_logger;
 mod error;
 mod general_api;
@@ -150,6 +151,32 @@ async fn create_udp_stream(socket_queue: &Option<Arc<SocketQueue>>, peer: Socket
     }
 }
 
+async fn resolve_domain(
+    domain: &str,
+    port: u16,
+    dns_addr: SocketAddr,
+    socket_queue: &Option<Arc<SocketQueue>>,
+) -> crate::Result<SocketAddr> {
+    let id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u16)
+        .unwrap_or(0);
+    let query = dns::build_dns_query(domain, id)?;
+
+    let mut dns_server = create_udp_stream(socket_queue, dns_addr).await?;
+    dns_server.write_all(&query).await?;
+
+    let mut buf = [0u8; 4096];
+    let len = tokio::time::timeout(std::time::Duration::from_secs(5), dns_server.read(&mut buf))
+        .await
+        .map_err(|_| "DNS resolve timeout")?
+        .map_err(|e| format!("DNS resolve read error: {e}"))?;
+
+    let message = dns::parse_data_to_dns_message(&buf[..len], false)?;
+    let ip = dns::extract_ipaddr_from_dns_message(&message)?;
+    Ok(SocketAddr::new(ip, port))
+}
+
 /// Run the proxy server
 /// # Arguments
 /// * `device` - The network device to use
@@ -180,6 +207,13 @@ where
     } else {
         None
     };
+
+    let dns_mapping: Option<dns_mapping::SharedDnsMapping> = if args.bypass_domain.is_empty() {
+        None
+    } else {
+        Some(Arc::new(Mutex::new(dns_mapping::DnsMapping::new())))
+    };
+    let no_proxy_mgr: Arc<dyn ProxyHandlerManager> = Arc::new(NoProxyManager::new());
 
     #[cfg(target_os = "linux")]
     let socket_queue = match args.socket_transfer_fd {
@@ -306,7 +340,7 @@ where
                     continue;
                 }
                 log::trace!("Session count {}", task_count.fetch_add(1, Relaxed).saturating_add(1));
-                let info = SessionInfo::new(tcp.local_addr(), tcp.peer_addr(), IpProtocol::Tcp);
+                let mut info = SessionInfo::new(tcp.local_addr(), tcp.peer_addr(), IpProtocol::Tcp);
                 let domain_name = if let Some(virtual_dns) = &virtual_dns {
                     let mut virtual_dns = virtual_dns.lock().await;
                     virtual_dns.touch_ip(&tcp.peer_addr().ip());
@@ -314,7 +348,36 @@ where
                 } else {
                     None
                 };
-                let proxy_handler = mgr.new_proxy_handler(info, domain_name, false).await?;
+                // For non-Virtual modes, supplement domain_name from dns_mapping
+                let domain_name = match domain_name {
+                    Some(name) => Some(name),
+                    None => {
+                        if let Some(ref mapping) = dns_mapping {
+                            mapping.lock().await.lookup(&tcp.peer_addr().ip()).map(|s| s.to_owned())
+                        } else {
+                            None
+                        }
+                    }
+                };
+                let should_bypass = domain_name.as_ref()
+                    .is_some_and(|d| dns_mapping::DnsMapping::should_bypass(d, &args.bypass_domain));
+
+                if should_bypass {
+                    // Virtual mode: Fake IP must be resolved to real IP
+                    if virtual_dns.is_some() {
+                        if let Some(ref domain) = domain_name {
+                            let port = info.dst.port();
+                            let dns_sock = SocketAddr::new(dns_addr, DNS_PORT);
+                            if let Ok(addr) = resolve_domain(domain, port, dns_sock, &socket_queue).await {
+                                info.dst = addr;
+                            }
+                        }
+                    }
+                    log::info!("Bypassing proxy for {info} (domain: {:?})", domain_name);
+                }
+
+                let handler_mgr = if should_bypass { &no_proxy_mgr } else { &mgr };
+                let proxy_handler = handler_mgr.new_proxy_handler(info, domain_name, false).await?;
                 let socket_queue = socket_queue.clone();
                 tokio::spawn(async move {
                     if let Err(err) = handle_tcp_session(tcp, proxy_handler, socket_queue).await {
@@ -342,8 +405,9 @@ where
                         info.protocol = IpProtocol::Tcp;
                         let proxy_handler = mgr.new_proxy_handler(info, None, false).await?;
                         let socket_queue = socket_queue.clone();
+                        let dns_mapping = dns_mapping.clone();
                         tokio::spawn(async move {
-                            if let Err(err) = handle_dns_over_tcp_session(udp, proxy_handler, socket_queue, ipv6_enabled).await {
+                            if let Err(err) = handle_dns_over_tcp_session(udp, proxy_handler, socket_queue, ipv6_enabled, dns_mapping).await {
                                 log::error!("{info} error \"{err}\"");
                             }
                             log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
@@ -364,8 +428,9 @@ where
                     if args.dns == ArgDns::Direct {
                         let dns_dest = info.dst;
                         let socket_queue = socket_queue.clone();
+                        let dns_mapping = dns_mapping.clone();
                         tokio::spawn(async move {
-                            if let Err(err) = handle_direct_dns_session(udp, dns_dest, socket_queue, ipv6_enabled).await {
+                            if let Err(err) = handle_direct_dns_session(udp, dns_dest, socket_queue, ipv6_enabled, dns_mapping).await {
                                 log::error!("{info} error \"{err}\"");
                             }
                             log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
@@ -381,34 +446,66 @@ where
                 } else {
                     None
                 };
+                // For non-Virtual modes, supplement domain_name from dns_mapping
+                let domain_name = match domain_name {
+                    Some(name) => Some(name),
+                    None => {
+                        if let Some(ref mapping) = dns_mapping {
+                            mapping.lock().await.lookup(&udp.peer_addr().ip()).map(|s| s.to_owned())
+                        } else {
+                            None
+                        }
+                    }
+                };
+                let should_bypass = domain_name.as_ref()
+                    .is_some_and(|d| dns_mapping::DnsMapping::should_bypass(d, &args.bypass_domain));
                 #[cfg(feature = "udpgw")]
                 if let Some(udpgw) = udpgw_client.clone() {
-                    let tcp_src = match udp.peer_addr() {
-                        SocketAddr::V4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
-                        SocketAddr::V6(_) => SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
-                    };
-                    let tcpinfo = SessionInfo::new(tcp_src, udpgw.get_udpgw_server_addr(), IpProtocol::Tcp);
-                    let proxy_handler = mgr.new_proxy_handler(tcpinfo, None, false).await?;
-                    let queue = socket_queue.clone();
-                    tokio::spawn(async move {
-                        let dst = info.dst; // real UDP destination address
-                        let dst_addr = match domain_name {
-                            Some(ref d) => socks5_impl::protocol::Address::from((d.clone(), dst.port())),
-                            None => dst.into(),
+                    if !should_bypass {
+                        let tcp_src = match udp.peer_addr() {
+                            SocketAddr::V4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+                            SocketAddr::V6(_) => SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
                         };
-                        if let Err(e) = handle_udp_gateway_session(udp, udpgw, &dst_addr, proxy_handler, queue, ipv6_enabled).await {
-                            log::info!("Ending {info} with \"{e}\"");
-                        }
-                        log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
-                    });
-                    continue;
+                        let tcpinfo = SessionInfo::new(tcp_src, udpgw.get_udpgw_server_addr(), IpProtocol::Tcp);
+                        let proxy_handler = mgr.new_proxy_handler(tcpinfo, None, false).await?;
+                        let queue = socket_queue.clone();
+                        tokio::spawn(async move {
+                            let dst = info.dst; // real UDP destination address
+                            let dst_addr = match domain_name {
+                                Some(ref d) => socks5_impl::protocol::Address::from((d.clone(), dst.port())),
+                                None => dst.into(),
+                            };
+                            if let Err(e) = handle_udp_gateway_session(udp, udpgw, &dst_addr, proxy_handler, queue, ipv6_enabled).await {
+                                log::info!("Ending {info} with \"{e}\"");
+                            }
+                            log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
+                        });
+                        continue;
+                    }
                 }
-                match mgr.new_proxy_handler(info, domain_name, true).await {
+
+                if should_bypass {
+                    // Virtual mode: Fake IP must be resolved to real IP
+                    if virtual_dns.is_some() {
+                        if let Some(ref domain) = domain_name {
+                            let port = info.dst.port();
+                            let dns_sock = SocketAddr::new(dns_addr, DNS_PORT);
+                            if let Ok(addr) = resolve_domain(domain, port, dns_sock, &socket_queue).await {
+                                info.dst = addr;
+                            }
+                        }
+                    }
+                    log::info!("Bypassing proxy for {info} (domain: {:?})", domain_name);
+                }
+
+                let handler_mgr = if should_bypass { &no_proxy_mgr } else { &mgr };
+                let ty = if should_bypass { ProxyType::None } else { args.proxy.proxy_type };
+                let dns_mapping = dns_mapping.clone();
+                match handler_mgr.new_proxy_handler(info, domain_name, true).await {
                     Ok(proxy_handler) => {
                         let socket_queue = socket_queue.clone();
                         tokio::spawn(async move {
-                            let ty = args.proxy.proxy_type;
-                            if let Err(err) = handle_udp_associate_session(udp, ty, proxy_handler, socket_queue, ipv6_enabled).await {
+                            if let Err(err) = handle_udp_associate_session(udp, ty, proxy_handler, socket_queue, ipv6_enabled, dns_mapping).await {
                                 log::info!("Ending {info} with \"{err}\"");
                             }
                             log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
@@ -459,6 +556,7 @@ async fn handle_direct_dns_session(
     dns_addr: SocketAddr,
     socket_queue: Option<Arc<SocketQueue>>,
     ipv6_enabled: bool,
+    dns_mapping: Option<dns_mapping::SharedDnsMapping>,
 ) -> crate::Result<()> {
     let mut dns_server = create_udp_stream(&socket_queue, dns_addr).await?;
 
@@ -481,15 +579,20 @@ async fn handle_direct_dns_session(
                 }
                 traffic_status::traffic_status_update(0, len)?;
 
-                let buf = if !ipv6_enabled {
-                    let mut message = dns::parse_data_to_dns_message(&buf2[..len], false)?;
-                    dns::remove_ipv6_entries(&mut message);
-                    message.to_vec()?
-                } else {
-                    buf2[..len].to_vec()
-                };
+                let mut message = dns::parse_data_to_dns_message(&buf2[..len], false)?;
 
-                udp.write_all(&buf).await?;
+                if let Some(ref dns_mapping) = dns_mapping {
+                    if let Ok(name) = dns::extract_domain_from_dns_message(&message) {
+                        let ips = dns::extract_all_ipaddrs_from_dns_message(&message);
+                        dns_mapping.lock().await.insert(&name, &ips);
+                    }
+                }
+
+                if !ipv6_enabled {
+                    dns::remove_ipv6_entries(&mut message);
+                }
+
+                udp.write_all(&message.to_vec()?).await?;
             }
         }
     }
@@ -691,6 +794,7 @@ async fn handle_udp_associate_session(
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
     socket_queue: Option<Arc<SocketQueue>>,
     ipv6_enabled: bool,
+    dns_mapping: Option<dns_mapping::SharedDnsMapping>,
 ) -> crate::Result<()> {
     use socks5_impl::protocol::{Address, StreamOperation, UdpHeader};
 
@@ -765,6 +869,14 @@ async fn handle_udp_associate_session(
 
                     let buf = if session_info.dst.port() == DNS_PORT {
                         let mut message = dns::parse_data_to_dns_message(data, false)?;
+
+                        if let Some(ref dns_mapping) = dns_mapping {
+                            if let Ok(name) = dns::extract_domain_from_dns_message(&message) {
+                                let ips = dns::extract_all_ipaddrs_from_dns_message(&message);
+                                dns_mapping.lock().await.insert(&name, &ips);
+                            }
+                        }
+
                         if !ipv6_enabled {
                             dns::remove_ipv6_entries(&mut message);
                         }
@@ -791,6 +903,7 @@ async fn handle_dns_over_tcp_session(
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
     socket_queue: Option<Arc<SocketQueue>>,
     ipv6_enabled: bool,
+    dns_mapping: Option<dns_mapping::SharedDnsMapping>,
 ) -> crate::Result<()> {
     let (session_info, server_addr) = {
         let handler = proxy_handler.lock().await;
@@ -854,6 +967,11 @@ async fn handle_dns_over_tcp_session(
                     let name = dns::extract_domain_from_dns_message(&message)?;
                     let ip = dns::extract_ipaddr_from_dns_message(&message);
                     log::trace!("DNS over TCP query result: {name} -> {ip:?}");
+
+                    if let Some(ref dns_mapping) = dns_mapping {
+                        let ips = dns::extract_all_ipaddrs_from_dns_message(&message);
+                        dns_mapping.lock().await.insert(&name, &ips);
+                    }
 
                     if !ipv6_enabled {
                         dns::remove_ipv6_entries(&mut message);
