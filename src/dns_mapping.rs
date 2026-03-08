@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
+use wildmatch::WildMatch;
 
 const MAPPING_TTL: Duration = Duration::from_secs(300);
 
@@ -38,12 +39,43 @@ impl DnsMapping {
             }
         })
     }
+}
 
-    pub fn should_bypass(domain: &str, bypass_list: &[String]) -> bool {
+enum BypassPattern {
+    Suffix(String),
+    Wildcard(WildMatch),
+}
+
+pub struct BypassMatcher {
+    patterns: Vec<BypassPattern>,
+}
+
+impl BypassMatcher {
+    pub fn new(bypass_list: &[String]) -> Self {
+        let patterns = bypass_list
+            .iter()
+            .map(|p| {
+                let p = p.trim_end_matches('.').to_ascii_lowercase();
+                if p.contains('*') || p.contains('?') {
+                    BypassPattern::Wildcard(WildMatch::new(&p))
+                } else {
+                    let p = p.trim_start_matches('.').to_owned();
+                    BypassPattern::Suffix(p)
+                }
+            })
+            .collect();
+        Self { patterns }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+
+    pub fn matches(&self, domain: &str) -> bool {
         let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-        bypass_list.iter().any(|pattern| {
-            let pattern = pattern.trim_start_matches('.').to_ascii_lowercase();
-            domain == pattern || domain.ends_with(&format!(".{pattern}"))
+        self.patterns.iter().any(|pat| match pat {
+            BypassPattern::Suffix(s) => domain == *s || domain.ends_with(&format!(".{s}")),
+            BypassPattern::Wildcard(w) => w.matches(&domain),
         })
     }
 }

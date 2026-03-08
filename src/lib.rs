@@ -218,7 +218,8 @@ where
         None
     };
 
-    let dns_mapping: Option<dns_mapping::SharedDnsMapping> = if args.bypass_domain.is_empty() {
+    let bypass_matcher = dns_mapping::BypassMatcher::new(&args.bypass_domain);
+    let dns_mapping: Option<dns_mapping::SharedDnsMapping> = if bypass_matcher.is_empty() {
         None
     } else {
         Some(Arc::new(Mutex::new(dns_mapping::DnsMapping::new())))
@@ -370,7 +371,7 @@ where
                     }
                 };
                 let should_bypass = domain_name.as_ref()
-                    .is_some_and(|d| dns_mapping::DnsMapping::should_bypass(d, &args.bypass_domain));
+                    .is_some_and(|d| bypass_matcher.matches(d));
 
                 if should_bypass {
                     // Virtual mode: Fake IP must be resolved to real IP
@@ -468,7 +469,7 @@ where
                     }
                 };
                 let should_bypass = domain_name.as_ref()
-                    .is_some_and(|d| dns_mapping::DnsMapping::should_bypass(d, &args.bypass_domain));
+                    .is_some_and(|d| bypass_matcher.matches(d));
                 #[cfg(feature = "udpgw")]
                 if let Some(udpgw) = udpgw_client.clone() {
                     if !should_bypass {
