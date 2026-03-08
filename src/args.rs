@@ -343,15 +343,17 @@ impl std::fmt::Display for ArgVerbosity {
 
 /// DNS query handling strategy
 /// - Virtual: Use a virtual DNS server to handle DNS queries, also known as Fake-IP mode
-/// - OverTcp: Use TCP to send DNS queries to the DNS server
-/// - Direct: Do not handle DNS by relying on DNS server bypassing
+/// - OverTcp: Use TCP to send DNS queries to the DNS server via proxy
+/// - Direct: Send DNS queries directly to the DNS server, bypassing both TUN and proxy
+/// - OverProxy: Send DNS queries through the proxy (SOCKS5 UDP associate or HTTP)
 #[repr(C)]
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
 pub enum ArgDns {
     Virtual = 0,
-    OverTcp,
+    OverTcp = 1,
     #[default]
-    Direct,
+    Direct = 2,
+    OverProxy = 3,
 }
 
 #[cfg(target_os = "android")]
@@ -362,6 +364,7 @@ impl TryFrom<jni::sys::jint> for ArgDns {
             0 => Ok(ArgDns::Virtual),
             1 => Ok(ArgDns::OverTcp),
             2 => Ok(ArgDns::Direct),
+            3 => Ok(ArgDns::OverProxy),
             _ => Err(Error::from("Invalid DNS strategy")),
         }
     }

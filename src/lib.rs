@@ -361,7 +361,18 @@ where
                         });
                         continue;
                     }
-                    assert_eq!(args.dns, ArgDns::Direct);
+                    if args.dns == ArgDns::Direct {
+                        let dns_dest = info.dst;
+                        let socket_queue = socket_queue.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = handle_direct_dns_session(udp, dns_dest, socket_queue, ipv6_enabled).await {
+                                log::error!("{info} error \"{err}\"");
+                            }
+                            log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
+                        });
+                        continue;
+                    }
+                    // ArgDns::OverProxy falls through to general UDP handling below
                 }
                 let domain_name = if let Some(virtual_dns) = &virtual_dns {
                     let mut virtual_dns = virtual_dns.lock().await;
@@ -439,6 +450,48 @@ async fn handle_virtual_dns_session(mut udp: IpStackUdpStream, dns: Arc<Mutex<Vi
         let (msg, qname, ip) = dns.lock().await.generate_query(&buf[..len])?;
         udp.write_all(&msg).await?;
         log::debug!("Virtual DNS query: {qname} -> {ip}");
+    }
+    Ok(())
+}
+
+async fn handle_direct_dns_session(
+    mut udp: IpStackUdpStream,
+    dns_addr: SocketAddr,
+    socket_queue: Option<Arc<SocketQueue>>,
+    ipv6_enabled: bool,
+) -> crate::Result<()> {
+    let mut dns_server = create_udp_stream(&socket_queue, dns_addr).await?;
+
+    let mut buf1 = [0_u8; 4096];
+    let mut buf2 = [0_u8; 4096];
+    loop {
+        tokio::select! {
+            len = udp.read(&mut buf1) => {
+                let len = len?;
+                if len == 0 {
+                    break;
+                }
+                traffic_status::traffic_status_update(len, 0)?;
+                dns_server.write_all(&buf1[..len]).await?;
+            }
+            len = dns_server.read(&mut buf2) => {
+                let len = len?;
+                if len == 0 {
+                    break;
+                }
+                traffic_status::traffic_status_update(0, len)?;
+
+                let buf = if !ipv6_enabled {
+                    let mut message = dns::parse_data_to_dns_message(&buf2[..len], false)?;
+                    dns::remove_ipv6_entries(&mut message);
+                    message.to_vec()?
+                } else {
+                    buf2[..len].to_vec()
+                };
+
+                udp.write_all(&buf).await?;
+            }
+        }
     }
     Ok(())
 }
