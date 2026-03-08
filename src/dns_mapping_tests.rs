@@ -181,3 +181,58 @@ fn test_wildcard_case_insensitive() {
     assert!(matcher.matches("www.google.com"));
     assert!(matcher.matches("WWW.GOOGLE.COM"));
 }
+
+// --- Edge case tests ---
+
+#[test]
+fn test_wildcard_question_mark() {
+    let list = vec!["google.co?".to_string()];
+    let matcher = BypassMatcher::new(&list);
+    assert!(matcher.matches("google.com"));
+    assert!(matcher.matches("google.cob"));
+    assert!(!matcher.matches("google.com.au"));
+    assert!(!matcher.matches("google.co"));
+}
+
+#[test]
+fn test_wildcard_star_does_not_match_bare_domain() {
+    // *.google.com requires at least one char before .google.com
+    let list = vec!["*.google.com".to_string()];
+    let matcher = BypassMatcher::new(&list);
+    assert!(matcher.matches("www.google.com"));
+    assert!(!matcher.matches("google.com"));
+}
+
+#[test]
+fn test_wildcard_pattern_trailing_dot_trimmed() {
+    let list = vec!["*.google.com.".to_string()];
+    let matcher = BypassMatcher::new(&list);
+    assert!(matcher.matches("www.google.com"));
+    assert!(matcher.matches("www.google.com."));
+}
+
+#[test]
+fn test_mixed_suffix_and_wildcard() {
+    let list = vec![
+        "github.com".to_string(),    // suffix
+        "*.google.*".to_string(),    // wildcard
+    ];
+    let matcher = BypassMatcher::new(&list);
+    // suffix path
+    assert!(matcher.matches("api.github.com"));
+    assert!(matcher.matches("github.com"));
+    // wildcard path
+    assert!(matcher.matches("www.google.com"));
+    assert!(matcher.matches("mail.google.org"));
+    // neither
+    assert!(!matcher.matches("example.com"));
+}
+
+#[test]
+fn test_bypass_is_empty() {
+    let non_empty = BypassMatcher::new(&vec!["x".to_string()]);
+    assert!(!non_empty.is_empty());
+
+    let empty = BypassMatcher::new(&vec![]);
+    assert!(empty.is_empty());
+}
