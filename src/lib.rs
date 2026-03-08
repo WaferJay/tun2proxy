@@ -177,6 +177,73 @@ async fn resolve_domain(
     Ok(SocketAddr::new(ip, port))
 }
 
+async fn lookup_domain_name(
+    ip: &IpAddr,
+    virtual_dns: &Option<Arc<Mutex<VirtualDns>>>,
+    dns_mapping: &Option<dns_mapping::SharedDnsMapping>,
+) -> Option<String> {
+    let domain_name = if let Some(virtual_dns) = virtual_dns {
+        let mut virtual_dns = virtual_dns.lock().await;
+        virtual_dns.touch_ip(ip);
+        virtual_dns.resolve_ip(ip).cloned()
+    } else {
+        None
+    };
+    match domain_name {
+        Some(name) => Some(name),
+        None => {
+            if let Some(mapping) = dns_mapping {
+                mapping.lock().await.lookup(ip).map(|s| s.to_owned())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// When bypassing in Virtual DNS mode, resolve the fake IP to a real address.
+/// Returns `false` if resolution fails, signaling the caller to fall back to proxy.
+async fn resolve_bypass_destination(
+    info: &mut SessionInfo,
+    domain_name: &Option<String>,
+    is_virtual_dns: bool,
+    dns_addr: IpAddr,
+    socket_queue: &Option<Arc<SocketQueue>>,
+) -> bool {
+    if is_virtual_dns {
+        if let Some(domain) = domain_name {
+            let dns_sock = SocketAddr::new(dns_addr, DNS_PORT);
+            match resolve_domain(domain, info.dst.port(), dns_sock, socket_queue).await {
+                Ok(addr) => info.dst = addr,
+                Err(e) => {
+                    log::warn!("Cannot resolve {domain} for bypass, falling back to proxy: {e}");
+                    return false;
+                }
+            }
+        }
+    }
+    log::info!("Bypassing proxy for {info} (domain: {domain_name:?})");
+    true
+}
+
+async fn snoop_dns_response(
+    data: &[u8],
+    dns_mapping: &Option<dns_mapping::SharedDnsMapping>,
+    ipv6_enabled: bool,
+) -> crate::Result<Vec<u8>> {
+    let mut message = dns::parse_data_to_dns_message(data, false)?;
+    if let Some(dns_mapping) = dns_mapping {
+        if let Ok(name) = dns::extract_domain_from_dns_message(&message) {
+            let ips = dns::extract_all_ipaddrs_from_dns_message(&message);
+            dns_mapping.lock().await.insert(&name, &ips);
+        }
+    }
+    if !ipv6_enabled {
+        dns::remove_ipv6_entries(&mut message);
+    }
+    Ok(message.to_vec()?)
+}
+
 /// Run the proxy server
 /// # Arguments
 /// * `device` - The network device to use
@@ -342,39 +409,14 @@ where
                 }
                 log::trace!("Session count {}", task_count.fetch_add(1, Relaxed).saturating_add(1));
                 let mut info = SessionInfo::new(tcp.local_addr(), tcp.peer_addr(), IpProtocol::Tcp);
-                let domain_name = if let Some(virtual_dns) = &virtual_dns {
-                    let mut virtual_dns = virtual_dns.lock().await;
-                    virtual_dns.touch_ip(&tcp.peer_addr().ip());
-                    virtual_dns.resolve_ip(&tcp.peer_addr().ip()).cloned()
-                } else {
-                    None
-                };
-                // For non-Virtual modes, supplement domain_name from dns_mapping
-                let domain_name = match domain_name {
-                    Some(name) => Some(name),
-                    None => {
-                        if let Some(ref mapping) = dns_mapping {
-                            mapping.lock().await.lookup(&tcp.peer_addr().ip()).map(|s| s.to_owned())
-                        } else {
-                            None
-                        }
-                    }
-                };
-                let should_bypass = domain_name.as_ref()
+                let domain_name = lookup_domain_name(&tcp.peer_addr().ip(), &virtual_dns, &dns_mapping).await;
+                let mut should_bypass = domain_name.as_ref()
                     .is_some_and(|d| bypass_matcher.matches(d));
 
                 if should_bypass {
-                    // Virtual mode: Fake IP must be resolved to real IP
-                    if virtual_dns.is_some() {
-                        if let Some(ref domain) = domain_name {
-                            let port = info.dst.port();
-                            let dns_sock = SocketAddr::new(dns_addr, DNS_PORT);
-                            if let Ok(addr) = resolve_domain(domain, port, dns_sock, &socket_queue).await {
-                                info.dst = addr;
-                            }
-                        }
-                    }
-                    log::info!("Bypassing proxy for {info} (domain: {:?})", domain_name);
+                    should_bypass = resolve_bypass_destination(
+                        &mut info, &domain_name, virtual_dns.is_some(), dns_addr, &socket_queue,
+                    ).await;
                 }
 
                 let handler_mgr = if should_bypass { &no_proxy_mgr } else { &mgr };
@@ -440,25 +482,8 @@ where
                     }
                     // ArgDns::OverProxy falls through to general UDP handling below
                 }
-                let domain_name = if let Some(virtual_dns) = &virtual_dns {
-                    let mut virtual_dns = virtual_dns.lock().await;
-                    virtual_dns.touch_ip(&udp.peer_addr().ip());
-                    virtual_dns.resolve_ip(&udp.peer_addr().ip()).cloned()
-                } else {
-                    None
-                };
-                // For non-Virtual modes, supplement domain_name from dns_mapping
-                let domain_name = match domain_name {
-                    Some(name) => Some(name),
-                    None => {
-                        if let Some(ref mapping) = dns_mapping {
-                            mapping.lock().await.lookup(&udp.peer_addr().ip()).map(|s| s.to_owned())
-                        } else {
-                            None
-                        }
-                    }
-                };
-                let should_bypass = domain_name.as_ref()
+                let domain_name = lookup_domain_name(&udp.peer_addr().ip(), &virtual_dns, &dns_mapping).await;
+                let mut should_bypass = domain_name.as_ref()
                     .is_some_and(|d| bypass_matcher.matches(d));
                 #[cfg(feature = "udpgw")]
                 if let Some(udpgw) = udpgw_client.clone() {
@@ -486,17 +511,9 @@ where
                 }
 
                 if should_bypass {
-                    // Virtual mode: Fake IP must be resolved to real IP
-                    if virtual_dns.is_some() {
-                        if let Some(ref domain) = domain_name {
-                            let port = info.dst.port();
-                            let dns_sock = SocketAddr::new(dns_addr, DNS_PORT);
-                            if let Ok(addr) = resolve_domain(domain, port, dns_sock, &socket_queue).await {
-                                info.dst = addr;
-                            }
-                        }
-                    }
-                    log::info!("Bypassing proxy for {info} (domain: {:?})", domain_name);
+                    should_bypass = resolve_bypass_destination(
+                        &mut info, &domain_name, virtual_dns.is_some(), dns_addr, &socket_queue,
+                    ).await;
                 }
 
                 let handler_mgr = if should_bypass { &no_proxy_mgr } else { &mgr };
@@ -580,20 +597,8 @@ async fn handle_direct_dns_session(
                 }
                 traffic_status::traffic_status_update(0, len)?;
 
-                let mut message = dns::parse_data_to_dns_message(&buf2[..len], false)?;
-
-                if let Some(ref dns_mapping) = dns_mapping {
-                    if let Ok(name) = dns::extract_domain_from_dns_message(&message) {
-                        let ips = dns::extract_all_ipaddrs_from_dns_message(&message);
-                        dns_mapping.lock().await.insert(&name, &ips);
-                    }
-                }
-
-                if !ipv6_enabled {
-                    dns::remove_ipv6_entries(&mut message);
-                }
-
-                udp.write_all(&message.to_vec()?).await?;
+                let buf = snoop_dns_response(&buf2[..len], &dns_mapping, ipv6_enabled).await?;
+                udp.write_all(&buf).await?;
             }
         }
     }
@@ -863,32 +868,19 @@ async fn handle_udp_associate_session(
 
                 crate::traffic_status::traffic_status_update(0, len)?;
 
-                if let ProxyType::Socks4 | ProxyType::Socks5 = proxy_type {
+                let data = if let ProxyType::Socks4 | ProxyType::Socks5 = proxy_type {
                     // Remove SOCKS5 UDP header from the server data
                     let header = UdpHeader::retrieve_from_stream(&mut &buf2[..])?;
-                    let data = &buf2[header.len()..];
+                    &buf2[header.len()..]
+                } else {
+                    buf2
+                };
 
-                    let buf = if session_info.dst.port() == DNS_PORT {
-                        let mut message = dns::parse_data_to_dns_message(data, false)?;
-
-                        if let Some(ref dns_mapping) = dns_mapping {
-                            if let Ok(name) = dns::extract_domain_from_dns_message(&message) {
-                                let ips = dns::extract_all_ipaddrs_from_dns_message(&message);
-                                dns_mapping.lock().await.insert(&name, &ips);
-                            }
-                        }
-
-                        if !ipv6_enabled {
-                            dns::remove_ipv6_entries(&mut message);
-                        }
-                        message.to_vec()?
-                    } else {
-                        data.to_vec()
-                    };
-
+                if session_info.dst.port() == DNS_PORT {
+                    let buf = snoop_dns_response(data, &dns_mapping, ipv6_enabled).await?;
                     udp_stack.write_all(&buf).await?;
                 } else {
-                    udp_stack.write_all(buf2).await?;
+                    udp_stack.write_all(data).await?;
                 }
             }
         }
