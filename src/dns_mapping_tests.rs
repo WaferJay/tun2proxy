@@ -60,58 +60,124 @@ fn test_insert_ipv6() {
     assert_eq!(mapping.lookup(&ip), Some("v6.example.com"));
 }
 
+// --- BypassMatcher tests (migrated from should_bypass) ---
+
 #[test]
-fn test_should_bypass_exact_match() {
+fn test_bypass_exact_match() {
     let list = vec!["google.com".to_string()];
-    assert!(DnsMapping::should_bypass("google.com", &list));
+    let matcher = BypassMatcher::new(&list);
+    assert!(matcher.matches("google.com"));
 }
 
 #[test]
-fn test_should_bypass_subdomain() {
+fn test_bypass_subdomain() {
     let list = vec!["google.com".to_string()];
-    assert!(DnsMapping::should_bypass("www.google.com", &list));
-    assert!(DnsMapping::should_bypass("mail.google.com", &list));
-    assert!(DnsMapping::should_bypass("a.b.c.google.com", &list));
+    let matcher = BypassMatcher::new(&list);
+    assert!(matcher.matches("www.google.com"));
+    assert!(matcher.matches("mail.google.com"));
+    assert!(matcher.matches("a.b.c.google.com"));
 }
 
 #[test]
-fn test_should_bypass_no_partial_match() {
+fn test_bypass_no_partial_match() {
     let list = vec!["google.com".to_string()];
+    let matcher = BypassMatcher::new(&list);
     // "notgoogle.com" ends with "google.com" but is not a subdomain
-    assert!(!DnsMapping::should_bypass("notgoogle.com", &list));
+    assert!(!matcher.matches("notgoogle.com"));
 }
 
 #[test]
-fn test_should_bypass_case_insensitive() {
+fn test_bypass_case_insensitive() {
     let list = vec!["Google.COM".to_string()];
-    assert!(DnsMapping::should_bypass("WWW.GOOGLE.COM", &list));
-    assert!(DnsMapping::should_bypass("www.google.com", &list));
+    let matcher = BypassMatcher::new(&list);
+    assert!(matcher.matches("WWW.GOOGLE.COM"));
+    assert!(matcher.matches("www.google.com"));
 }
 
 #[test]
-fn test_should_bypass_trailing_dot() {
+fn test_bypass_trailing_dot() {
     let list = vec!["google.com".to_string()];
-    assert!(DnsMapping::should_bypass("google.com.", &list));
-    assert!(DnsMapping::should_bypass("www.google.com.", &list));
+    let matcher = BypassMatcher::new(&list);
+    assert!(matcher.matches("google.com."));
+    assert!(matcher.matches("www.google.com."));
 }
 
 #[test]
-fn test_should_bypass_pattern_with_leading_dot() {
+fn test_bypass_pattern_with_leading_dot() {
     let list = vec![".google.com".to_string()];
-    assert!(DnsMapping::should_bypass("www.google.com", &list));
-    assert!(DnsMapping::should_bypass("google.com", &list));
+    let matcher = BypassMatcher::new(&list);
+    assert!(matcher.matches("www.google.com"));
+    assert!(matcher.matches("google.com"));
 }
 
 #[test]
-fn test_should_bypass_empty_list() {
+fn test_bypass_empty_list() {
     let list: Vec<String> = vec![];
-    assert!(!DnsMapping::should_bypass("google.com", &list));
+    let matcher = BypassMatcher::new(&list);
+    assert!(!matcher.matches("google.com"));
+    assert!(matcher.is_empty());
 }
 
 #[test]
-fn test_should_bypass_multiple_patterns() {
+fn test_bypass_multiple_patterns() {
     let list = vec!["google.com".to_string(), "github.com".to_string()];
-    assert!(DnsMapping::should_bypass("www.google.com", &list));
-    assert!(DnsMapping::should_bypass("api.github.com", &list));
-    assert!(!DnsMapping::should_bypass("example.com", &list));
+    let matcher = BypassMatcher::new(&list);
+    assert!(matcher.matches("www.google.com"));
+    assert!(matcher.matches("api.github.com"));
+    assert!(!matcher.matches("example.com"));
+}
+
+// --- Wildcard pattern tests ---
+
+#[test]
+fn test_wildcard_star_google_com() {
+    let list = vec!["*.google.com".to_string()];
+    let matcher = BypassMatcher::new(&list);
+    assert!(matcher.matches("www.google.com"));
+    assert!(matcher.matches("a.b.google.com"));
+    assert!(!matcher.matches("google.org"));
+}
+
+#[test]
+fn test_wildcard_star_matches_everything() {
+    let list = vec!["*".to_string()];
+    let matcher = BypassMatcher::new(&list);
+    assert!(matcher.matches("anything.example.com"));
+    assert!(matcher.matches("google.com"));
+    assert!(matcher.matches("x"));
+}
+
+#[test]
+fn test_wildcard_google_star() {
+    let list = vec!["google.*".to_string()];
+    let matcher = BypassMatcher::new(&list);
+    assert!(matcher.matches("google.com"));
+    assert!(matcher.matches("google.org"));
+    assert!(!matcher.matches("www.google.com"));
+}
+
+#[test]
+fn test_wildcard_star_google_star() {
+    let list = vec!["*google*".to_string()];
+    let matcher = BypassMatcher::new(&list);
+    assert!(matcher.matches("www.google.com"));
+    assert!(matcher.matches("mygoogle.org"));
+    assert!(!matcher.matches("example.com"));
+}
+
+#[test]
+fn test_wildcard_star_dot_google_dot_star() {
+    let list = vec!["*.google.*".to_string()];
+    let matcher = BypassMatcher::new(&list);
+    assert!(matcher.matches("www.google.com"));
+    assert!(matcher.matches("mail.google.org"));
+    assert!(!matcher.matches("example.com"));
+}
+
+#[test]
+fn test_wildcard_case_insensitive() {
+    let list = vec!["*.Google.COM".to_string()];
+    let matcher = BypassMatcher::new(&list);
+    assert!(matcher.matches("www.google.com"));
+    assert!(matcher.matches("WWW.GOOGLE.COM"));
 }
