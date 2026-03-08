@@ -271,6 +271,11 @@ impl Args {
         self
     }
 
+    pub fn bypass_domain(&mut self, domain: String) -> &mut Self {
+        self.bypass_domain.push(domain);
+        self
+    }
+
     pub fn ipv6_enabled(&mut self, ipv6_enabled: bool) -> &mut Self {
         self.ipv6_enabled = ipv6_enabled;
         self
