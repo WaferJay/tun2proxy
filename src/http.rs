@@ -15,12 +15,12 @@ use unicase::UniCase;
 pub(crate) type DigestState = digest_auth::WwwAuthenticateHeader;
 
 pub enum AuthResult {
-    /// This authenticator does not handle the response.
-    Unhandled,
-    /// Handled – retry with the current authenticator (e.g. Digest stale nonce refresh).
+    /// Abort the connection – treat the response as a fatal error.
+    Abort,
+    /// Retry the request with the current authenticator (e.g. Digest stale nonce refresh).
     Retry,
-    /// Handled – replace the authenticator and retry (e.g. Basic → Digest upgrade).
-    Switch(Arc<dyn HttpAuthenticator>),
+    /// Replace the authenticator and retry (e.g. Basic → Digest upgrade).
+    RetryWith(Arc<dyn HttpAuthenticator>),
 }
 
 #[async_trait::async_trait]
@@ -28,9 +28,9 @@ pub trait HttpAuthenticator: Send + Sync {
     /// Generate authentication request headers, returning `(name, value)` pairs.
     async fn generate_auth_headers(&self, uri: &str) -> Result<Vec<(String, String)>>;
 
-    /// Handle a non-200 response.
+    /// Called when the proxy responds with a non-200 status code (e.g. 407).
     /// `is_retry` is `true` when auth has already been attempted on this connection.
-    async fn handle_response(
+    async fn handle_failure(
         &self,
         status_code: u16,
         response_headers: &HashMap<UniCase<&str>, &[u8], RandomState>,
@@ -67,14 +67,14 @@ impl HttpAuthenticator for BasicPasswordAuthenticator {
         )])
     }
 
-    async fn handle_response(
+    async fn handle_failure(
         &self,
         status_code: u16,
         response_headers: &HashMap<UniCase<&str>, &[u8], RandomState>,
         _is_retry: bool,
     ) -> Result<AuthResult> {
         if status_code != 407 {
-            return Ok(AuthResult::Unhandled);
+            return Ok(AuthResult::Abort);
         }
 
         let Some(auth_data) = response_headers.get(&UniCase::new(PROXY_AUTHENTICATE)) else {
@@ -94,7 +94,7 @@ impl HttpAuthenticator for BasicPasswordAuthenticator {
             credentials: self.credentials.clone(),
             digest_state: self.digest_state.clone(),
         });
-        Ok(AuthResult::Switch(digest_auth))
+        Ok(AuthResult::RetryWith(digest_auth))
     }
 }
 
@@ -127,14 +127,14 @@ impl HttpAuthenticator for DigestPasswordAuthenticator {
         )])
     }
 
-    async fn handle_response(
+    async fn handle_failure(
         &self,
         status_code: u16,
         response_headers: &HashMap<UniCase<&str>, &[u8], RandomState>,
         is_retry: bool,
     ) -> Result<AuthResult> {
         if status_code != 407 {
-            return Ok(AuthResult::Unhandled);
+            return Ok(AuthResult::Abort);
         }
 
         let Some(auth_data) = response_headers.get(&UniCase::new(PROXY_AUTHENTICATE)) else {
@@ -305,15 +305,15 @@ impl HttpConnection {
                 };
 
                 match auth
-                    .handle_response(status_code, &headers_map, self.before)
+                    .handle_failure(status_code, &headers_map, self.before)
                     .await?
                 {
                     AuthResult::Retry => { /* use current authenticator */ }
-                    AuthResult::Switch(new_auth) => {
+                    AuthResult::RetryWith(new_auth) => {
                         self.authenticator = Some(new_auth.clone());
                         *self.shared_auth.lock().await = Some(new_auth);
                     }
-                    AuthResult::Unhandled => {
+                    AuthResult::Abort => {
                         return Err(
                             format!("HTTP {} [{}]", status_code, reason).into()
                         );
@@ -525,3 +525,7 @@ impl HttpManager {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "http_tests.rs"]
+mod tests;
