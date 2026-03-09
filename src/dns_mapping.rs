@@ -7,37 +7,101 @@ use std::{
 use tokio::sync::Mutex;
 use wildmatch::WildMatch;
 
-const MAPPING_TTL: Duration = Duration::from_secs(300);
+const DEFAULT_TTL: Duration = Duration::from_secs(300);
+const MIN_TTL: Duration = Duration::from_secs(10);
+const MAX_TTL: Duration = Duration::from_secs(3600);
 
-pub struct DnsMapping {
-    map: HashMap<IpAddr, (String, Instant)>,
+struct CachedIp {
+    addr: IpAddr,
+    expiry: Instant,
 }
 
-pub type SharedDnsMapping = Arc<Mutex<DnsMapping>>;
+struct ForwardEntry {
+    ips: Vec<CachedIp>,
+}
 
-impl DnsMapping {
+pub struct DnsCache {
+    forward: HashMap<String, ForwardEntry>,
+    reverse: HashMap<IpAddr, Vec<(String, Instant)>>,
+}
+
+pub type SharedDnsCache = Arc<Mutex<DnsCache>>;
+
+fn clamp_ttl(ttl_secs: u32) -> Duration {
+    Duration::from_secs(ttl_secs as u64).clamp(MIN_TTL, MAX_TTL)
+}
+
+impl DnsCache {
     pub fn new() -> Self {
         Self {
-            map: HashMap::new(),
+            forward: HashMap::new(),
+            reverse: HashMap::new(),
         }
     }
 
-    pub fn insert(&mut self, domain: &str, ips: &[IpAddr]) {
-        let expiry = Instant::now() + MAPPING_TTL;
+    pub fn insert(&mut self, domain: &str, entries: &[(IpAddr, u32)]) {
         let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-        for ip in ips {
-            self.map.insert(*ip, (domain.clone(), expiry));
+        let now = Instant::now();
+
+        let cached_ips: Vec<CachedIp> = entries
+            .iter()
+            .map(|(addr, ttl)| {
+                let expiry = now + clamp_ttl(*ttl);
+                CachedIp { addr: *addr, expiry }
+            })
+            .collect();
+
+        // Update reverse map
+        for ci in &cached_ips {
+            let rev_entry = self.reverse.entry(ci.addr).or_insert_with(Vec::new);
+            // Remove existing entry for this domain (will re-add at end for recency)
+            rev_entry.retain(|(d, _)| d != &domain);
+            rev_entry.push((domain.clone(), ci.expiry));
         }
+
+        self.forward.insert(domain, ForwardEntry { ips: cached_ips });
     }
 
-    pub fn lookup(&self, ip: &IpAddr) -> Option<&str> {
-        self.map.get(ip).and_then(|(domain, expiry)| {
-            if Instant::now() <= *expiry {
-                Some(domain.as_str())
-            } else {
-                None
-            }
-        })
+    pub fn insert_with_default_ttl(&mut self, domain: &str, ips: &[IpAddr]) {
+        let entries: Vec<(IpAddr, u32)> = ips.iter().map(|ip| (*ip, DEFAULT_TTL.as_secs() as u32)).collect();
+        self.insert(domain, &entries);
+    }
+
+    pub fn lookup_ips(&self, domain: &str) -> Option<Vec<IpAddr>> {
+        let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+        let now = Instant::now();
+        self.forward.get(&domain).map(|entry| {
+            entry
+                .ips
+                .iter()
+                .filter(|ci| now <= ci.expiry)
+                .map(|ci| ci.addr)
+                .collect()
+        }).and_then(|ips: Vec<IpAddr>| if ips.is_empty() { None } else { Some(ips) })
+    }
+
+    pub fn lookup_domains(&self, ip: &IpAddr) -> Option<Vec<&str>> {
+        let now = Instant::now();
+        self.reverse.get(ip).map(|entries| {
+            entries
+                .iter()
+                .rev() // newest first (appended at end)
+                .filter(|(_, expiry)| now <= *expiry)
+                .map(|(domain, _)| domain.as_str())
+                .collect()
+        }).and_then(|domains: Vec<&str>| if domains.is_empty() { None } else { Some(domains) })
+    }
+
+    pub fn evict_expired(&mut self) {
+        let now = Instant::now();
+        self.forward.retain(|_, entry| {
+            entry.ips.retain(|ci| now <= ci.expiry);
+            !entry.ips.is_empty()
+        });
+        self.reverse.retain(|_, entries| {
+            entries.retain(|(_, expiry)| now <= *expiry);
+            !entries.is_empty()
+        });
     }
 }
 

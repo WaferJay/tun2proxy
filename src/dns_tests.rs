@@ -192,7 +192,66 @@ fn test_dns_over_tcp_framing() {
     assert_eq!(parsed.queries().len(), 1);
 }
 
-// ── Existing functional tests ───────────────────────────────────────
+fn build_test_response_with_ttls(domain: &str, entries: &[(IpAddr, u32)]) -> Message {
+    let name = Name::from_str(domain).unwrap();
+    let query = Query::query(name.clone(), RecordType::A);
+    let mut msg = Message::new();
+    msg.set_id(1234);
+    msg.set_message_type(MessageType::Response);
+    msg.add_query(query);
+    for (ip, ttl) in entries {
+        let record = match ip {
+            IpAddr::V4(v4) => Record::from_rdata(name.clone(), *ttl, RData::A(A(*v4))),
+            IpAddr::V6(v6) => Record::from_rdata(name.clone(), *ttl, RData::AAAA(AAAA(*v6))),
+        };
+        msg.add_answer(record);
+    }
+    msg
+}
+
+// ── extract_ip_ttl_pairs tests ──────────────────────────────────────
+
+#[test]
+fn test_extract_ip_ttl_pairs_basic() {
+    let ip1 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+    let ip2 = IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8));
+    let msg = build_test_response_with_ttls("example.com", &[(ip1, 60), (ip2, 120)]);
+
+    let pairs = extract_ip_ttl_pairs_from_dns_message(&msg);
+    assert_eq!(pairs.len(), 2);
+    assert_eq!(pairs[0], (ip1, 60));
+    assert_eq!(pairs[1], (ip2, 120));
+}
+
+#[test]
+fn test_extract_ip_ttl_pairs_mixed_v4_v6() {
+    let v4 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+    let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+    let msg = build_test_response_with_ttls("example.com", &[(v4, 30), (v6, 600)]);
+
+    let pairs = extract_ip_ttl_pairs_from_dns_message(&msg);
+    assert_eq!(pairs.len(), 2);
+    assert_eq!(pairs[0], (v4, 30));
+    assert_eq!(pairs[1], (v6, 600));
+}
+
+#[test]
+fn test_extract_ip_ttl_pairs_empty() {
+    let msg = build_test_response("example.com", &[]);
+    let pairs = extract_ip_ttl_pairs_from_dns_message(&msg);
+    assert!(pairs.is_empty());
+}
+
+#[test]
+fn test_extract_ip_ttl_pairs_uses_existing_helper() {
+    // Verify TTL=300 from the standard build_test_response helper
+    let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let msg = build_test_response("example.com", &[ip]);
+
+    let pairs = extract_ip_ttl_pairs_from_dns_message(&msg);
+    assert_eq!(pairs.len(), 1);
+    assert_eq!(pairs[0], (ip, 300));
+}
 
 #[test]
 fn test_extract_all_ipaddrs_multiple_a_records() {
