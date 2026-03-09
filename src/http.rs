@@ -21,6 +21,8 @@ pub enum AuthResult {
     Retry,
     /// Replace the authenticator and retry (e.g. Basic → Digest upgrade).
     RetryWith(Arc<dyn HttpAuthenticator>),
+    /// Bypass the proxy and connect directly to the destination.
+    Bypass,
 }
 
 #[async_trait::async_trait]
@@ -317,6 +319,15 @@ impl HttpConnection {
                         return Err(
                             format!("HTTP {} [{}]", status_code, reason).into()
                         );
+                    }
+                    AuthResult::Bypass => {
+                        self.server_inbuf.clear();
+                        self.server_outbuf.clear();
+                        self.client_inbuf.clear();
+                        self.client_outbuf.clear();
+                        self.server_addr = self.info.dst;
+                        self.state = HttpState::Established;
+                        return Ok(());
                     }
                 }
                 self.before = true;

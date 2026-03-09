@@ -2,6 +2,7 @@ use super::*;
 use crate::directions::{IncomingDataEvent, IncomingDirection, OutgoingDirection};
 use crate::proxy_handler::ProxyHandler;
 use crate::session_info::{IpProtocol, SessionInfo};
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 
 /// Helper: create an `HttpConnection` with Basic auth, consume the initial CONNECT request,
@@ -219,4 +220,222 @@ async fn test_non_407_error_without_auth() {
         err_msg.contains("502") && err_msg.contains("Bad Gateway"),
         "error should contain status code and reason, got: {err_msg}"
     );
+}
+
+/// A mock authenticator that always returns `AuthResult::Bypass`.
+struct BypassAuthenticator;
+
+#[async_trait::async_trait]
+impl HttpAuthenticator for BypassAuthenticator {
+    async fn generate_auth_headers(&self, _uri: &str) -> crate::Result<Vec<(String, String)>> {
+        Ok(vec![])
+    }
+
+    async fn handle_failure(
+        &self,
+        _status_code: u16,
+        _response_headers: &HashMap<UniCase<&str>, &[u8], std::hash::RandomState>,
+        _is_retry: bool,
+    ) -> crate::Result<AuthResult> {
+        Ok(AuthResult::Bypass)
+    }
+}
+
+/// Helper: create an `HttpConnection` with BypassAuthenticator, consume the initial CONNECT request.
+async fn setup_bypass_conn() -> HttpConnection {
+    let src = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 12345);
+    let dst = SocketAddr::new(Ipv4Addr::new(93, 184, 216, 34).into(), 443);
+    let proxy_addr = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 8080);
+    let info = SessionInfo::new(src, dst, IpProtocol::Tcp);
+
+    let auth: Arc<dyn HttpAuthenticator> = Arc::new(BypassAuthenticator);
+    let shared_auth: Arc<Mutex<Option<Arc<dyn HttpAuthenticator>>>> =
+        Arc::new(Mutex::new(Some(auth.clone())));
+
+    let mut conn = HttpConnection::new(proxy_addr, info, None, Some(auth), shared_auth)
+        .await
+        .expect("HttpConnection::new should succeed");
+
+    let len = conn.data_len(OutgoingDirection::ToServer);
+    conn.consume_data(OutgoingDirection::ToServer, len);
+
+    conn
+}
+
+#[tokio::test]
+async fn test_bypass_sets_established_and_changes_server_addr() {
+    let mut conn = setup_bypass_conn().await;
+
+    // Before bypass: server_addr is the proxy address.
+    let proxy_addr = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 8080);
+    let dst = SocketAddr::new(Ipv4Addr::new(93, 184, 216, 34).into(), 443);
+    assert_eq!(conn.get_server_addr(), proxy_addr);
+    assert!(!conn.connection_established());
+
+    // Feed a 407 response — BypassAuthenticator will return Bypass.
+    let response_407 = b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+        Content-Length: 0\r\n\
+        \r\n";
+    conn.push_data(IncomingDataEvent {
+        direction: IncomingDirection::FromServer,
+        buffer: response_407,
+    })
+    .await
+    .expect("push_data should succeed for bypass");
+
+    // After bypass: connection should be established with server_addr changed to dst.
+    assert!(
+        conn.connection_established(),
+        "connection should be established after Bypass"
+    );
+    assert_eq!(
+        conn.get_server_addr(),
+        dst,
+        "server_addr should be changed to destination after Bypass"
+    );
+}
+
+#[tokio::test]
+async fn test_bypass_clears_all_buffers() {
+    let mut conn = setup_bypass_conn().await;
+
+    // Feed a 407 with a body (Content-Length: 13) on a keep-alive connection.
+    // The Bypass handler fires during header processing, before the body is consumed.
+    let response_407 = b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+        Content-Length: 13\r\n\
+        \r\n\
+        Unauthorized!";
+    conn.push_data(IncomingDataEvent {
+        direction: IncomingDirection::FromServer,
+        buffer: response_407,
+    })
+    .await
+    .expect("push_data should succeed for bypass");
+
+    assert!(conn.connection_established());
+
+    // All outgoing buffers should be empty — no leftover proxy data.
+    assert_eq!(
+        conn.data_len(OutgoingDirection::ToServer),
+        0,
+        "server outbuf should be empty after bypass"
+    );
+    assert_eq!(
+        conn.data_len(OutgoingDirection::ToClient),
+        0,
+        "client outbuf should be empty after bypass"
+    );
+}
+
+#[tokio::test]
+async fn test_bypass_passthrough_after_established() {
+    let mut conn = setup_bypass_conn().await;
+
+    let response_407 = b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+        Content-Length: 0\r\n\
+        \r\n";
+    conn.push_data(IncomingDataEvent {
+        direction: IncomingDirection::FromServer,
+        buffer: response_407,
+    })
+    .await
+    .expect("push_data should succeed for bypass");
+
+    assert!(conn.connection_established());
+
+    // After bypass + established, data should pass through bidirectionally.
+    let server_data = b"Hello from direct server";
+    conn.push_data(IncomingDataEvent {
+        direction: IncomingDirection::FromServer,
+        buffer: server_data,
+    })
+    .await
+    .expect("push_data with tunnel data should succeed");
+
+    let event = conn.peek_data(OutgoingDirection::ToClient);
+    assert_eq!(
+        event.buffer, server_data,
+        "server data should be forwarded to client after bypass"
+    );
+
+    let client_data = b"Hello from client";
+    conn.push_data(IncomingDataEvent {
+        direction: IncomingDirection::FromClient,
+        buffer: client_data,
+    })
+    .await
+    .expect("push_data with client data should succeed");
+
+    // Consume the previous server→client data first.
+    let len = conn.data_len(OutgoingDirection::ToClient);
+    conn.consume_data(OutgoingDirection::ToClient, len);
+
+    let event = conn.peek_data(OutgoingDirection::ToServer);
+    assert_eq!(
+        event.buffer, client_data,
+        "client data should be forwarded to server after bypass"
+    );
+}
+
+#[tokio::test]
+async fn test_bypass_on_connection_close_response() {
+    let mut conn = setup_bypass_conn().await;
+
+    let dst = SocketAddr::new(Ipv4Addr::new(93, 184, 216, 34).into(), 443);
+
+    // Feed a 407 with Connection: close — the Bypass arm fires before the
+    // close/reset logic, so it should still work.
+    let response_407 = b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+        Connection: close\r\n\
+        Content-Length: 0\r\n\
+        \r\n";
+    conn.push_data(IncomingDataEvent {
+        direction: IncomingDirection::FromServer,
+        buffer: response_407,
+    })
+    .await
+    .expect("push_data should succeed for bypass with Connection: close");
+
+    assert!(
+        conn.connection_established(),
+        "connection should be established after Bypass even with Connection: close"
+    );
+    assert_eq!(
+        conn.get_server_addr(),
+        dst,
+        "server_addr should be destination after Bypass with Connection: close"
+    );
+}
+
+#[tokio::test]
+async fn test_bypass_on_non_407_status() {
+    let src = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 12345);
+    let dst = SocketAddr::new(Ipv4Addr::new(93, 184, 216, 34).into(), 443);
+    let proxy_addr = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 8080);
+    let info = SessionInfo::new(src, dst, IpProtocol::Tcp);
+
+    let auth: Arc<dyn HttpAuthenticator> = Arc::new(BypassAuthenticator);
+    let shared_auth: Arc<Mutex<Option<Arc<dyn HttpAuthenticator>>>> =
+        Arc::new(Mutex::new(Some(auth.clone())));
+
+    let mut conn = HttpConnection::new(proxy_addr, info, None, Some(auth), shared_auth)
+        .await
+        .expect("HttpConnection::new should succeed");
+
+    let len = conn.data_len(OutgoingDirection::ToServer);
+    conn.consume_data(OutgoingDirection::ToServer, len);
+
+    // BypassAuthenticator returns Bypass for any status code, including 503.
+    let response_503 = b"HTTP/1.1 503 Service Unavailable\r\n\
+        Content-Length: 0\r\n\
+        \r\n";
+    conn.push_data(IncomingDataEvent {
+        direction: IncomingDirection::FromServer,
+        buffer: response_503,
+    })
+    .await
+    .expect("push_data should succeed for bypass on 503");
+
+    assert!(conn.connection_established());
+    assert_eq!(conn.get_server_addr(), dst);
 }

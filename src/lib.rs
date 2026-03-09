@@ -69,6 +69,16 @@ pub mod win_svc;
 
 const DNS_PORT: u16 = 53;
 
+/// Result of a proxy handshake session.
+enum ProxyResult {
+    /// Proxy connection established normally.
+    Established,
+    /// Proxy indicated bypass; connect directly to this address instead.
+    Bypass(SocketAddr),
+    /// Proxy returned a UDP associate address.
+    UdpAssociate(SocketAddr),
+}
+
 #[allow(unused)]
 #[derive(Hash, Copy, Clone, Eq, PartialEq, Debug)]
 #[cfg_attr(
@@ -534,9 +544,17 @@ async fn handle_tcp_session(
 
     log::info!("Beginning {session_info}");
 
-    if let Err(e) = handle_proxy_session(&mut server, proxy_handler).await {
-        tcp_stack.shutdown().await?;
-        return Err(e);
+    match handle_proxy_session(&mut server, proxy_handler).await {
+        Err(e) => {
+            tcp_stack.shutdown().await?;
+            return Err(e);
+        }
+        Ok(ProxyResult::Bypass(bypass_addr)) => {
+            let _ = server.shutdown().await;
+            log::info!("{session_info} bypassing proxy, connecting directly to {bypass_addr}");
+            server = create_tcp_stream(&socket_queue, bypass_addr).await?;
+        }
+        Ok(ProxyResult::Established) | Ok(ProxyResult::UdpAssociate(_)) => {}
     }
 
     let (mut t_rx, mut t_tx) = tokio::io::split(tcp_stack);
@@ -587,8 +605,17 @@ async fn handle_udp_gateway_session(
             }
             None => {
                 let mut tcp_server_stream = create_tcp_stream(&socket_queue, proxy_server_addr).await?;
-                if let Err(e) = handle_proxy_session(&mut tcp_server_stream, proxy_handler).await {
-                    return Err(format!("udpgw connection error: {e}").into());
+                match handle_proxy_session(&mut tcp_server_stream, proxy_handler).await {
+                    Err(e) => return Err(format!("udpgw connection error: {e}").into()),
+                    Ok(ProxyResult::Bypass(bypass_addr)) => {
+                        let _ = tcp_server_stream.shutdown().await;
+                        log::info!("udpgw bypassing proxy, connecting directly to {bypass_addr}");
+                        tcp_server_stream = create_tcp_stream(&socket_queue, bypass_addr).await?;
+                    }
+                    Ok(ProxyResult::UdpAssociate(_)) => {
+                        return Err("unexpected UDP associate response in udpgw session".into());
+                    }
+                    Ok(ProxyResult::Established) => {}
                 }
                 break UdpGwClientStream::new(tcp_server_stream);
             }
@@ -712,8 +739,13 @@ async fn handle_udp_associate_session(
         Some(udp_addr) => (None, udp_addr),
         None => {
             let mut server = create_tcp_stream(&socket_queue, server_addr).await?;
-            let udp_addr = handle_proxy_session(&mut server, proxy_handler).await?;
-            (Some(server), udp_addr.ok_or("udp associate failed")?)
+            let result = handle_proxy_session(&mut server, proxy_handler).await?;
+            match result {
+                ProxyResult::UdpAssociate(addr) => (Some(server), addr),
+                ProxyResult::Established | ProxyResult::Bypass(_) => {
+                    return Err("udp associate failed".into());
+                }
+            }
         }
     };
 
@@ -802,7 +834,17 @@ async fn handle_dns_over_tcp_session(
 
     log::info!("Beginning {session_info}");
 
-    let _ = handle_proxy_session(&mut server, proxy_handler).await?;
+    match handle_proxy_session(&mut server, proxy_handler).await? {
+        ProxyResult::Established => {}
+        ProxyResult::Bypass(bypass_addr) => {
+            let _ = server.shutdown().await;
+            log::info!("{session_info} bypassing proxy, connecting directly to {bypass_addr}");
+            server = create_tcp_stream(&socket_queue, bypass_addr).await?;
+        }
+        ProxyResult::UdpAssociate(_) => {
+            return Err("unexpected UDP associate response in DNS-over-TCP session".into());
+        }
+    }
 
     let mut buf1 = [0_u8; 4096];
     let mut buf2 = [0_u8; 4096];
@@ -881,11 +923,12 @@ async fn handle_dns_over_tcp_session(
 /// This function is used to handle the business logic of tun2proxy and SOCKS5 server.
 /// When handling UDP proxy, the return value UDP associate IP address is the result of this business logic.
 /// However, when handling TCP business logic, the return value Ok(None) is meaningless, just indicating that the operation was successful.
-async fn handle_proxy_session(server: &mut TcpStream, proxy_handler: Arc<Mutex<dyn ProxyHandler>>) -> crate::Result<Option<SocketAddr>> {
+async fn handle_proxy_session(server: &mut TcpStream, proxy_handler: Arc<Mutex<dyn ProxyHandler>>) -> crate::Result<ProxyResult> {
     let mut launched = false;
     let mut proxy_handler = proxy_handler.lock().await;
     let dir = OutgoingDirection::ToServer;
     let (mut tx, mut rx) = (0, 0);
+    let initial_server_addr = proxy_handler.get_server_addr();
 
     loop {
         if proxy_handler.connection_established() {
@@ -926,5 +969,16 @@ async fn handle_proxy_session(server: &mut TcpStream, proxy_handler: Arc<Mutex<d
         }
     }
     crate::traffic_status::traffic_status_update(tx, rx)?;
-    Ok(proxy_handler.get_udp_associate())
+    let current_server_addr = proxy_handler.get_server_addr();
+    if current_server_addr != initial_server_addr {
+        return Ok(ProxyResult::Bypass(current_server_addr));
+    }
+    match proxy_handler.get_udp_associate() {
+        Some(addr) => Ok(ProxyResult::UdpAssociate(addr)),
+        None => Ok(ProxyResult::Established),
+    }
 }
+
+#[cfg(test)]
+#[path = "lib_tests.rs"]
+mod proxy_result_tests;
