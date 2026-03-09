@@ -73,6 +73,21 @@ pub fn extract_all_ipaddrs_from_dns_message(message: &Message) -> Vec<IpAddr> {
         .collect()
 }
 
+pub fn extract_ip_ttl_pairs_from_dns_message(message: &Message) -> Vec<(IpAddr, u32)> {
+    message
+        .answers()
+        .iter()
+        .filter_map(|answer| {
+            let ip = match answer.data() {
+                RData::A(addr) => Some(IpAddr::V4((*addr).into())),
+                RData::AAAA(addr) => Some(IpAddr::V6((*addr).into())),
+                _ => None,
+            };
+            ip.map(|ip| (ip, answer.ttl()))
+        })
+        .collect()
+}
+
 pub fn extract_domain_from_dns_message(message: &Message) -> Result<String, String> {
     let query = message.queries().first().ok_or("DnsRequest no query body")?;
     let name = query.name().to_string();
