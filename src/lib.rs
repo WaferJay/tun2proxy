@@ -1021,50 +1021,53 @@ async fn handle_dns_over_tcp_session(
         }
     }
 
-    let mut buf1 = [0_u8; 4096];
-    let mut buf2 = [0_u8; 4096];
+    let mut udp_recv_buf = [0u8; 4096];
+    let mut tcp_recv_buf = [0u8; 4096];
+    let mut tcp_pending = Vec::new();
     loop {
         tokio::select! {
-            len = udp_stack.read(&mut buf1) => {
-                let len = len?;
-                if len == 0 {
-                    break;
-                }
-                let buf1 = &buf1[..len];
+            len = udp_stack.read(&mut udp_recv_buf) => {
+                let len = match len {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) => {
+                        log::debug!("{session_info} UDP read error: {e}, closing session");
+                        break;
+                    }
+                };
+                let udp_data = &udp_recv_buf[..len];
 
-                _ = dns::parse_data_to_dns_message(buf1, false)?;
+                _ = dns::parse_data_to_dns_message(udp_data, false)?;
 
                 // Insert the DNS message length in front of the payload
-                let len = u16::try_from(buf1.len())?;
+                let len = u16::try_from(udp_data.len())?;
                 let mut buf = Vec::with_capacity(std::mem::size_of::<u16>() + usize::from(len));
                 buf.extend_from_slice(&len.to_be_bytes());
-                buf.extend_from_slice(buf1);
+                buf.extend_from_slice(udp_data);
 
                 server.write_all(&buf).await?;
 
                 crate::traffic_status::traffic_status_update(buf.len(), 0)?;
             }
-            len = server.read(&mut buf2) => {
+            len = server.read(&mut tcp_recv_buf) => {
                 let len = len?;
                 if len == 0 {
                     break;
                 }
-                let mut buf = buf2[..len].to_vec();
+                tcp_pending.extend_from_slice(&tcp_recv_buf[..len]);
 
                 crate::traffic_status::traffic_status_update(0, len)?;
 
                 let mut to_send: VecDeque<Vec<u8>> = VecDeque::new();
-                loop {
-                    if buf.len() < 2 {
-                        break;
-                    }
-                    let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-                    if buf.len() < len + 2 {
+                while tcp_pending.len() >= 2 {
+                    let msg_len = u16::from_be_bytes([tcp_pending[0], tcp_pending[1]]) as usize;
+                    if tcp_pending.len() < msg_len + 2 {
                         break;
                     }
 
                     // remove the length field
-                    let data = buf[2..len + 2].to_vec();
+                    let data = tcp_pending[2..msg_len + 2].to_vec();
+                    tcp_pending.drain(..msg_len + 2);
 
                     let mut message = dns::parse_data_to_dns_message(&data, false)?;
 
@@ -1084,10 +1087,6 @@ async fn handle_dns_over_tcp_session(
                     }
 
                     to_send.push_back(message.to_vec()?);
-                    if len + 2 == buf.len() {
-                        break;
-                    }
-                    buf = buf[len + 2..].to_vec();
                 }
 
                 while let Some(packet) = to_send.pop_front() {
@@ -1097,6 +1096,7 @@ async fn handle_dns_over_tcp_session(
         }
     }
 
+    let _ = server.shutdown().await;
     log::info!("Ending {session_info}");
 
     Ok(())
