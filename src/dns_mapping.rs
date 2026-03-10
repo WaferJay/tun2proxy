@@ -7,8 +7,7 @@ use std::{
 use tokio::sync::Mutex;
 use wildmatch::WildMatch;
 
-const DEFAULT_TTL: Duration = Duration::from_secs(300);
-const MIN_TTL: Duration = Duration::from_secs(10);
+pub const MIN_TTL: Duration = Duration::from_secs(10);
 const MAX_TTL: Duration = Duration::from_secs(3600);
 
 struct CachedIp {
@@ -53,18 +52,13 @@ impl DnsCache {
 
         // Update reverse map
         for ci in &cached_ips {
-            let rev_entry = self.reverse.entry(ci.addr).or_insert_with(Vec::new);
+            let rev_entry = self.reverse.entry(ci.addr).or_default();
             // Remove existing entry for this domain (will re-add at end for recency)
             rev_entry.retain(|(d, _)| d != &domain);
             rev_entry.push((domain.clone(), ci.expiry));
         }
 
         self.forward.insert(domain, ForwardEntry { ips: cached_ips });
-    }
-
-    pub fn insert_with_default_ttl(&mut self, domain: &str, ips: &[IpAddr]) {
-        let entries: Vec<(IpAddr, u32)> = ips.iter().map(|ip| (*ip, DEFAULT_TTL.as_secs() as u32)).collect();
-        self.insert(domain, &entries);
     }
 
     pub fn lookup_ips(&self, domain: &str) -> Option<Vec<IpAddr>> {
@@ -141,6 +135,12 @@ impl BypassMatcher {
             BypassPattern::Suffix(s) => domain == *s || domain.ends_with(&format!(".{s}")),
             BypassPattern::Wildcard(w) => w.matches(&domain),
         })
+    }
+
+    /// Returns true only when ALL the given domains match bypass patterns.
+    /// Returns false if the list is empty (conservative: no domain info → no bypass).
+    pub fn matches_all(&self, domains: &[&str]) -> bool {
+        !domains.is_empty() && domains.iter().all(|d| self.matches(d))
     }
 }
 
