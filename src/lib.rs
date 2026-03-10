@@ -227,6 +227,37 @@ async fn lookup_domain_name(
     }
 }
 
+/// Conservative bypass check: only bypass when ALL domains for an IP match.
+///
+/// Virtual DNS provides a 1:1 mapping (one fake IP per domain), so a single
+/// match is sufficient.  DNS cache, however, can map one IP to many domains
+/// (e.g. CDN shared IPs), so ALL associated domains must match.
+async fn check_bypass_ip(
+    ip: &IpAddr,
+    virtual_dns: &Option<Arc<Mutex<VirtualDns>>>,
+    dns_cache: &dns_mapping::SharedDnsCache,
+    bypass_matcher: &dns_mapping::BypassMatcher,
+) -> bool {
+    if bypass_matcher.is_empty() {
+        return false;
+    }
+
+    // Virtual DNS: 1:1 mapping, single domain is definitive.
+    if let Some(virtual_dns) = virtual_dns {
+        let mut virtual_dns = virtual_dns.lock().await;
+        if let Some(domain) = virtual_dns.resolve_ip(ip) {
+            return bypass_matcher.matches(domain);
+        }
+    }
+
+    // DNS cache: one IP may map to multiple domains.
+    // Conservative: only bypass when ALL associated domains match.
+    let cache = dns_cache.lock().await;
+    cache
+        .lookup_domains(ip)
+        .is_some_and(|domains| bypass_matcher.matches_all(&domains))
+}
+
 /// When bypassing in Virtual DNS mode, resolve the fake IP to a real address.
 /// Returns `false` if resolution fails, signaling the caller to fall back to proxy.
 async fn resolve_bypass_destination(
@@ -306,6 +337,22 @@ where
     let dns_cache: dns_mapping::SharedDnsCache =
         Arc::new(Mutex::new(dns_mapping::DnsCache::new()));
     let no_proxy_mgr: Arc<dyn ProxyHandlerManager> = Arc::new(NoProxyManager::new());
+
+    // Periodically evict expired DNS cache entries.
+    {
+        let dns_cache = dns_cache.clone();
+        let shutdown = shutdown_token.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(dns_mapping::MIN_TTL) => {
+                        dns_cache.lock().await.evict_expired();
+                    }
+                }
+            }
+        });
+    }
 
     #[cfg(target_os = "linux")]
     let socket_queue = match args.socket_transfer_fd {
@@ -434,8 +481,7 @@ where
                 log::trace!("Session count {}", task_count.fetch_add(1, Relaxed).saturating_add(1));
                 let mut info = SessionInfo::new(tcp.local_addr(), tcp.peer_addr(), IpProtocol::Tcp);
                 let domain_name = lookup_domain_name(&tcp.peer_addr().ip(), &virtual_dns, &dns_cache).await;
-                let mut should_bypass = domain_name.as_ref()
-                    .is_some_and(|d| bypass_matcher.matches(d));
+                let mut should_bypass = check_bypass_ip(&tcp.peer_addr().ip(), &virtual_dns, &dns_cache, &bypass_matcher).await;
 
                 if should_bypass {
                     should_bypass = resolve_bypass_destination(
@@ -507,8 +553,7 @@ where
                     // ArgDns::OverProxy falls through to general UDP handling below
                 }
                 let domain_name = lookup_domain_name(&udp.peer_addr().ip(), &virtual_dns, &dns_cache).await;
-                let mut should_bypass = domain_name.as_ref()
-                    .is_some_and(|d| bypass_matcher.matches(d));
+                let mut should_bypass = check_bypass_ip(&udp.peer_addr().ip(), &virtual_dns, &dns_cache, &bypass_matcher).await;
                 #[cfg(feature = "udpgw")]
                 if let Some(udpgw) = udpgw_client.clone() {
                     if !should_bypass {
@@ -519,13 +564,14 @@ where
                         let tcpinfo = SessionInfo::new(tcp_src, udpgw.get_udpgw_server_addr(), IpProtocol::Tcp);
                         let proxy_handler = mgr.new_proxy_handler(tcpinfo, None, false).await?;
                         let queue = socket_queue.clone();
+                        let dns_cache = dns_cache.clone();
                         tokio::spawn(async move {
                             let dst = info.dst; // real UDP destination address
                             let dst_addr = match domain_name {
                                 Some(ref d) => socks5_impl::protocol::Address::from((d.clone(), dst.port())),
                                 None => dst.into(),
                             };
-                            if let Err(e) = handle_udp_gateway_session(udp, udpgw, &dst_addr, proxy_handler, queue, ipv6_enabled).await {
+                            if let Err(e) = handle_udp_gateway_session(udp, udpgw, &dst_addr, proxy_handler, queue, ipv6_enabled, dns_cache).await {
                                 log::info!("Ending {info} with \"{e}\"");
                             }
                             log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
@@ -712,6 +758,7 @@ async fn handle_udp_gateway_session(
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
     socket_queue: Option<Arc<SocketQueue>>,
     ipv6_enabled: bool,
+    dns_cache: dns_mapping::SharedDnsCache,
 ) -> crate::Result<()> {
     let proxy_server_addr = { proxy_handler.lock().await.get_server_addr() };
     let udp_mtu = udpgw_client.get_udp_mtu();
@@ -816,7 +863,15 @@ async fn handle_udp_gateway_session(
                             let len = data.len();
                             let f = data.header.flags;
                             log::debug!("[UdpGw] stream {sn} {} <- {} receive {f} len {len}", &tcp_local_addr, udp_dst);
-                            if let Err(e) = udp_stack.write_all(&data.data).await {
+                            let payload = if udp_dst.port() == DNS_PORT {
+                                match snoop_dns_response(&data.data, &dns_cache, ipv6_enabled).await {
+                                    Ok(buf) => buf,
+                                    Err(_) => data.data,
+                                }
+                            } else {
+                                data.data
+                            };
+                            if let Err(e) = udp_stack.write_all(&payload).await {
                                 log::error!("[UdpGw] Ending stream {} {} <> {} with send_udp_packet {}", sn, &tcp_local_addr, udp_dst, e);
                                 break;
                             }
