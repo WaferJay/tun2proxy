@@ -6,14 +6,12 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 #[test]
 fn test_insert_and_lookup() {
     let mut cache = DnsCache::new();
-    let ips = vec![
-        IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
-        IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
-    ];
-    cache.insert_with_default_ttl("example.com", &ips);
+    let ip1 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+    let ip2 = IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8));
+    cache.insert("example.com", &[(ip1, 300), (ip2, 300)]);
 
-    assert_eq!(cache.lookup_domains(&ips[0]).unwrap()[0], "example.com");
-    assert_eq!(cache.lookup_domains(&ips[1]).unwrap()[0], "example.com");
+    assert_eq!(cache.lookup_domains(&ip1).unwrap()[0], "example.com");
+    assert_eq!(cache.lookup_domains(&ip2).unwrap()[0], "example.com");
 }
 
 #[test]
@@ -26,19 +24,19 @@ fn test_lookup_missing() {
 #[test]
 fn test_insert_normalizes_trailing_dot() {
     let mut cache = DnsCache::new();
-    let ips = vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))];
-    cache.insert_with_default_ttl("example.com.", &ips);
+    let ip = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+    cache.insert("example.com.", &[(ip, 300)]);
 
-    assert_eq!(cache.lookup_domains(&ips[0]).unwrap()[0], "example.com");
+    assert_eq!(cache.lookup_domains(&ip).unwrap()[0], "example.com");
 }
 
 #[test]
 fn test_insert_normalizes_case() {
     let mut cache = DnsCache::new();
-    let ips = vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))];
-    cache.insert_with_default_ttl("Example.COM", &ips);
+    let ip = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+    cache.insert("Example.COM", &[(ip, 300)]);
 
-    assert_eq!(cache.lookup_domains(&ips[0]).unwrap()[0], "example.com");
+    assert_eq!(cache.lookup_domains(&ip).unwrap()[0], "example.com");
 }
 
 #[test]
@@ -46,8 +44,8 @@ fn test_insert_multiple_domains_same_ip() {
     let mut cache = DnsCache::new();
     let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
 
-    cache.insert_with_default_ttl("old.com", &[ip]);
-    cache.insert_with_default_ttl("new.com", &[ip]);
+    cache.insert("old.com", &[(ip, 300)]);
+    cache.insert("new.com", &[(ip, 300)]);
 
     // Both domains should be visible, newest first
     let domains = cache.lookup_domains(&ip).unwrap();
@@ -60,7 +58,7 @@ fn test_insert_multiple_domains_same_ip() {
 fn test_insert_ipv6() {
     let mut cache = DnsCache::new();
     let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
-    cache.insert_with_default_ttl("v6.example.com", &[ip]);
+    cache.insert("v6.example.com", &[(ip, 300)]);
 
     assert_eq!(cache.lookup_domains(&ip).unwrap()[0], "v6.example.com");
 }
@@ -72,7 +70,7 @@ fn test_lookup_ips_basic() {
     let mut cache = DnsCache::new();
     let ip1 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
     let ip2 = IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8));
-    cache.insert_with_default_ttl("example.com", &[ip1, ip2]);
+    cache.insert("example.com", &[(ip1, 300), (ip2, 300)]);
 
     let ips = cache.lookup_ips("example.com").unwrap();
     assert_eq!(ips.len(), 2);
@@ -90,7 +88,7 @@ fn test_lookup_ips_missing() {
 fn test_lookup_ips_normalizes_domain() {
     let mut cache = DnsCache::new();
     let ip = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
-    cache.insert_with_default_ttl("Example.COM.", &[ip]);
+    cache.insert("Example.COM.", &[(ip, 300)]);
 
     assert!(cache.lookup_ips("example.com").is_some());
     assert!(cache.lookup_ips("Example.COM.").is_some());
@@ -326,9 +324,38 @@ fn test_mixed_suffix_and_wildcard() {
 
 #[test]
 fn test_bypass_is_empty() {
-    let non_empty = BypassMatcher::new(&vec!["x".to_string()]);
+    let non_empty = BypassMatcher::new(&["x".to_string()]);
     assert!(!non_empty.is_empty());
 
-    let empty = BypassMatcher::new(&vec![]);
+    let empty = BypassMatcher::new(&[]);
     assert!(empty.is_empty());
+}
+
+// --- matches_all tests ---
+
+#[test]
+fn test_matches_all_all_match() {
+    let matcher = BypassMatcher::new(&["google.com".to_string()]);
+    assert!(matcher.matches_all(&["www.google.com", "mail.google.com"]));
+}
+
+#[test]
+fn test_matches_all_one_mismatch() {
+    let matcher = BypassMatcher::new(&["google.com".to_string()]);
+    // "evil.org" does not match → should NOT bypass
+    assert!(!matcher.matches_all(&["www.google.com", "evil.org"]));
+}
+
+#[test]
+fn test_matches_all_empty_domains() {
+    let matcher = BypassMatcher::new(&["google.com".to_string()]);
+    // No domain info → conservative, no bypass
+    assert!(!matcher.matches_all(&[]));
+}
+
+#[test]
+fn test_matches_all_single_domain() {
+    let matcher = BypassMatcher::new(&["example.com".to_string()]);
+    assert!(matcher.matches_all(&["example.com"]));
+    assert!(!matcher.matches_all(&["other.com"]));
 }

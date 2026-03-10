@@ -61,18 +61,6 @@ pub fn extract_ipaddr_from_dns_message(message: &Message) -> Result<IpAddr, Stri
     Err(format!("{:?}", message.answers()))
 }
 
-pub fn extract_all_ipaddrs_from_dns_message(message: &Message) -> Vec<IpAddr> {
-    message
-        .answers()
-        .iter()
-        .filter_map(|answer| match answer.data() {
-            RData::A(addr) => Some(IpAddr::V4((*addr).into())),
-            RData::AAAA(addr) => Some(IpAddr::V6((*addr).into())),
-            _ => None,
-        })
-        .collect()
-}
-
 pub fn extract_ip_ttl_pairs_from_dns_message(message: &Message) -> Vec<(IpAddr, u32)> {
     message
         .answers()

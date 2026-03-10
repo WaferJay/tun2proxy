@@ -169,10 +169,11 @@ fn test_full_dns_flow_simulation() {
     // 3. Client parses response (same as tun2proxy snooping)
     let parsed = parse_data_to_dns_message(&resp_bytes, false).unwrap();
     let name = extract_domain_from_dns_message(&parsed).unwrap();
-    let ips = extract_all_ipaddrs_from_dns_message(&parsed);
+    let pairs = extract_ip_ttl_pairs_from_dns_message(&parsed);
 
     assert!(name.trim_end_matches('.') == domain);
-    assert_eq!(ips, vec![IpAddr::V4(server_ip)]);
+    assert_eq!(pairs.len(), 1);
+    assert_eq!(pairs[0].0, IpAddr::V4(server_ip));
 }
 
 /// Verify DNS-over-TCP framing: 2-byte length prefix + message
@@ -254,37 +255,6 @@ fn test_extract_ip_ttl_pairs_uses_existing_helper() {
 }
 
 #[test]
-fn test_extract_all_ipaddrs_multiple_a_records() {
-    let ip1 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-    let ip2 = IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8));
-    let msg = build_test_response("example.com", &[ip1, ip2]);
-
-    let ips = extract_all_ipaddrs_from_dns_message(&msg);
-    assert_eq!(ips.len(), 2);
-    assert!(ips.contains(&ip1));
-    assert!(ips.contains(&ip2));
-}
-
-#[test]
-fn test_extract_all_ipaddrs_mixed_a_and_aaaa() {
-    let v4 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-    let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
-    let msg = build_test_response("example.com", &[v4, v6]);
-
-    let ips = extract_all_ipaddrs_from_dns_message(&msg);
-    assert_eq!(ips.len(), 2);
-    assert!(ips.contains(&v4));
-    assert!(ips.contains(&v6));
-}
-
-#[test]
-fn test_extract_all_ipaddrs_empty_response() {
-    let msg = build_test_response("example.com", &[]);
-    let ips = extract_all_ipaddrs_from_dns_message(&msg);
-    assert!(ips.is_empty());
-}
-
-#[test]
 fn test_extract_single_ipaddr() {
     let ip = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
     let msg = build_test_response("example.com", &[ip]);
@@ -327,8 +297,9 @@ fn test_remove_ipv6_entries_keeps_v4() {
     remove_ipv6_entries(&mut msg);
     assert_eq!(msg.answers().len(), 1);
 
-    let ips = extract_all_ipaddrs_from_dns_message(&msg);
-    assert_eq!(ips, vec![v4]);
+    let pairs = extract_ip_ttl_pairs_from_dns_message(&msg);
+    assert_eq!(pairs.len(), 1);
+    assert_eq!(pairs[0].0, v4);
 }
 
 #[test]
@@ -339,6 +310,7 @@ fn test_parse_data_roundtrip() {
     let parsed = parse_data_to_dns_message(&bytes, false).unwrap();
 
     assert_eq!(parsed.id(), original.id());
-    let ips = extract_all_ipaddrs_from_dns_message(&parsed);
-    assert_eq!(ips, vec![ip]);
+    let pairs = extract_ip_ttl_pairs_from_dns_message(&parsed);
+    assert_eq!(pairs.len(), 1);
+    assert_eq!(pairs[0].0, ip);
 }
