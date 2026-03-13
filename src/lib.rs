@@ -195,9 +195,12 @@ async fn resolve_domain(
     let ip = dns::extract_ipaddr_from_dns_message(&message)?;
 
     // 3. Store results in cache
-    let entries = dns::extract_ip_ttl_pairs_from_dns_message(&message);
-    if !entries.is_empty() {
-        dns_cache.lock().await.insert(domain, &entries);
+    let records = dns::extract_dns_records_from_message(&message);
+    if records
+        .iter()
+        .any(|r| matches!(r, dns_mapping::DnsRecord::A(..) | dns_mapping::DnsRecord::AAAA(..)))
+    {
+        dns_cache.lock().await.insert(domain, &records);
     }
 
     Ok(SocketAddr::new(ip, port))
@@ -283,9 +286,12 @@ async fn resolve_bypass_destination(
 async fn snoop_dns_response(data: &[u8], dns_cache: &dns_mapping::SharedDnsCache, ipv6_enabled: bool) -> crate::Result<Vec<u8>> {
     let mut message = dns::parse_data_to_dns_message(data, false)?;
     if let Ok(name) = dns::extract_domain_from_dns_message(&message) {
-        let entries = dns::extract_ip_ttl_pairs_from_dns_message(&message);
-        if !entries.is_empty() {
-            dns_cache.lock().await.insert(&name, &entries);
+        let records = dns::extract_dns_records_from_message(&message);
+        if records
+            .iter()
+            .any(|r| matches!(r, dns_mapping::DnsRecord::A(..) | dns_mapping::DnsRecord::AAAA(..)))
+        {
+            dns_cache.lock().await.insert(&name, &records);
         }
     }
     if !ipv6_enabled {
@@ -636,8 +642,8 @@ async fn handle_virtual_dns_session(mut udp: IpStackUdpStream, dns: Arc<Mutex<Vi
 async fn try_resolve_from_cache(query_data: &[u8], dns_cache: &dns_mapping::SharedDnsCache, ipv6_enabled: bool) -> Option<Vec<u8>> {
     let message = dns::parse_data_to_dns_message(query_data, false).ok()?;
     let domain = dns::extract_domain_from_dns_message(&message).ok()?;
-    let entries = dns_cache.lock().await.lookup_with_ttl(&domain)?;
-    let mut response = dns::build_dns_response_from_cache(message, &domain, &entries).ok()?;
+    let records = dns_cache.lock().await.lookup_with_ttl(&domain)?;
+    let mut response = dns::build_dns_response_from_cache(message, &domain, &records).ok()?;
     if !ipv6_enabled {
         dns::remove_ipv6_entries(&mut response);
     }
@@ -1111,9 +1117,9 @@ async fn handle_dns_over_tcp_session(
                     log::trace!("DNS over TCP query result: {name} -> {ip:?}");
 
                     {
-                        let entries = dns::extract_ip_ttl_pairs_from_dns_message(&message);
-                        if !entries.is_empty() {
-                            dns_cache.lock().await.insert(&name, &entries);
+                        let records = dns::extract_dns_records_from_message(&message);
+                        if records.iter().any(|r| matches!(r, dns_mapping::DnsRecord::A(..) | dns_mapping::DnsRecord::AAAA(..))) {
+                            dns_cache.lock().await.insert(&name, &records);
                         }
                     }
 

@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    net::IpAddr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -10,13 +10,31 @@ use wildmatch::WildMatch;
 pub const MIN_TTL: Duration = Duration::from_secs(10);
 const MAX_TTL: Duration = Duration::from_secs(3600);
 
-struct CachedIp {
-    addr: IpAddr,
+/// DNS record type with TTL, used as input/output for the cache.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::upper_case_acronyms)]
+pub enum DnsRecord {
+    A(Ipv4Addr, u32),
+    AAAA(Ipv6Addr, u32),
+    /// CNAME record: (from, to, ttl)
+    Cname(String, String, u32),
+}
+
+#[derive(Debug, Clone)]
+#[allow(clippy::upper_case_acronyms)]
+enum CachedRecord {
+    A(Ipv4Addr),
+    AAAA(Ipv6Addr),
+    Cname(String, String), // (from, to)
+}
+
+struct CachedEntry {
+    record: CachedRecord,
     expiry: Instant,
 }
 
 struct ForwardEntry {
-    ips: Vec<CachedIp>,
+    entries: Vec<CachedEntry>,
 }
 
 pub struct DnsCache {
@@ -38,36 +56,82 @@ impl DnsCache {
         }
     }
 
-    pub fn insert(&mut self, domain: &str, entries: &[(IpAddr, u32)]) {
+    pub fn insert(&mut self, domain: &str, records: &[DnsRecord]) {
         let domain = domain.trim_end_matches('.').to_ascii_lowercase();
         let now = Instant::now();
 
-        let cached_ips: Vec<CachedIp> = entries
+        let cached_entries: Vec<CachedEntry> = records
             .iter()
-            .map(|(addr, ttl)| {
-                let expiry = now + clamp_ttl(*ttl);
-                CachedIp { addr: *addr, expiry }
+            .map(|r| match r {
+                DnsRecord::A(addr, ttl) => CachedEntry {
+                    record: CachedRecord::A(*addr),
+                    expiry: now + clamp_ttl(*ttl),
+                },
+                DnsRecord::AAAA(addr, ttl) => CachedEntry {
+                    record: CachedRecord::AAAA(*addr),
+                    expiry: now + clamp_ttl(*ttl),
+                },
+                DnsRecord::Cname(from, to, ttl) => CachedEntry {
+                    record: CachedRecord::Cname(
+                        from.trim_end_matches('.').to_ascii_lowercase(),
+                        to.trim_end_matches('.').to_ascii_lowercase(),
+                    ),
+                    expiry: now + clamp_ttl(*ttl),
+                },
             })
             .collect();
 
-        // Update reverse map
-        for ci in &cached_ips {
-            let rev_entry = self.reverse.entry(ci.addr).or_default();
-            // Remove existing entry for this domain (will re-add at end for recency)
-            rev_entry.retain(|(d, _)| d != &domain);
-            rev_entry.push((domain.clone(), ci.expiry));
+        // Collect all CNAME "from" domains for reverse map association
+        let cname_from_domains: Vec<String> = cached_entries
+            .iter()
+            .filter_map(|e| {
+                if let CachedRecord::Cname(from, _) = &e.record {
+                    Some(from.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Update reverse map: for each IP, add the query domain + CNAME from domains
+        for entry in &cached_entries {
+            let ip = match &entry.record {
+                CachedRecord::A(addr) => IpAddr::V4(*addr),
+                CachedRecord::AAAA(addr) => IpAddr::V6(*addr),
+                CachedRecord::Cname(..) => continue,
+            };
+            let rev_entry = self.reverse.entry(ip).or_default();
+            // Remove existing entries for this domain and CNAME from domains
+            rev_entry.retain(|(d, _)| d != &domain && !cname_from_domains.contains(d));
+            // Add the query domain
+            rev_entry.push((domain.clone(), entry.expiry));
+            // Add CNAME from domains (they are also associated with this IP)
+            for cname_from in &cname_from_domains {
+                if *cname_from != domain {
+                    rev_entry.push((cname_from.clone(), entry.expiry));
+                }
+            }
         }
 
-        self.forward.insert(domain, ForwardEntry { ips: cached_ips });
+        self.forward.insert(domain, ForwardEntry { entries: cached_entries });
     }
 
     pub fn lookup_ips(&self, domain: &str) -> Option<Vec<IpAddr>> {
         let domain = domain.trim_end_matches('.').to_ascii_lowercase();
         let now = Instant::now();
-        self.forward
-            .get(&domain)
-            .map(|entry| entry.ips.iter().filter(|ci| now <= ci.expiry).map(|ci| ci.addr).collect())
-            .and_then(|ips: Vec<IpAddr>| if ips.is_empty() { None } else { Some(ips) })
+        self.forward.get(&domain).and_then(|entry| {
+            let ips: Vec<IpAddr> = entry
+                .entries
+                .iter()
+                .filter(|e| now <= e.expiry)
+                .filter_map(|e| match &e.record {
+                    CachedRecord::A(addr) => Some(IpAddr::V4(*addr)),
+                    CachedRecord::AAAA(addr) => Some(IpAddr::V6(*addr)),
+                    CachedRecord::Cname(..) => None,
+                })
+                .collect();
+            if ips.is_empty() { None } else { Some(ips) }
+        })
     }
 
     pub fn lookup_domains(&self, ip: &IpAddr) -> Option<Vec<&str>> {
@@ -85,25 +149,38 @@ impl DnsCache {
             .and_then(|domains: Vec<&str>| if domains.is_empty() { None } else { Some(domains) })
     }
 
-    pub fn lookup_with_ttl(&self, domain: &str) -> Option<Vec<(IpAddr, u32)>> {
+    pub fn lookup_with_ttl(&self, domain: &str) -> Option<Vec<DnsRecord>> {
         let domain = domain.trim_end_matches('.').to_ascii_lowercase();
         let now = Instant::now();
         self.forward.get(&domain).and_then(|entry| {
-            let results: Vec<(IpAddr, u32)> = entry
-                .ips
+            let results: Vec<DnsRecord> = entry
+                .entries
                 .iter()
-                .filter(|ci| now <= ci.expiry)
-                .map(|ci| (ci.addr, ci.expiry.duration_since(now).as_secs() as u32))
+                .filter(|e| now <= e.expiry)
+                .map(|e| {
+                    let remaining_ttl = e.expiry.duration_since(now).as_secs() as u32;
+                    match &e.record {
+                        CachedRecord::A(addr) => DnsRecord::A(*addr, remaining_ttl),
+                        CachedRecord::AAAA(addr) => DnsRecord::AAAA(*addr, remaining_ttl),
+                        CachedRecord::Cname(from, to) => DnsRecord::Cname(from.clone(), to.clone(), remaining_ttl),
+                    }
+                })
                 .collect();
-            if results.is_empty() { None } else { Some(results) }
+            // Only return if there is at least one A/AAAA record (CNAME alone is useless)
+            let has_ip = results.iter().any(|r| matches!(r, DnsRecord::A(..) | DnsRecord::AAAA(..)));
+            if has_ip { Some(results) } else { None }
         })
     }
 
     pub fn evict_expired(&mut self) {
         let now = Instant::now();
         self.forward.retain(|_, entry| {
-            entry.ips.retain(|ci| now <= ci.expiry);
-            !entry.ips.is_empty()
+            entry.entries.retain(|e| now <= e.expiry);
+            // Keep entry if any A/AAAA records remain (CNAME alone is meaningless)
+            entry
+                .entries
+                .iter()
+                .any(|e| matches!(e.record, CachedRecord::A(_) | CachedRecord::AAAA(_)))
         });
         self.reverse.retain(|_, entries| {
             entries.retain(|(_, expiry)| now <= *expiry);

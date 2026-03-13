@@ -1,8 +1,9 @@
+use crate::dns_mapping::DnsRecord;
 use hickory_proto::{
     op::{Message, MessageType, OpCode, Query, ResponseCode},
     rr::{
         Name, RData, Record, RecordType,
-        rdata::{A, AAAA},
+        rdata::{A, AAAA, CNAME},
     },
 };
 use std::{net::IpAddr, str::FromStr};
@@ -32,15 +33,33 @@ pub fn build_dns_response(mut request: Message, domain: &str, ip: IpAddr, ttl: u
     Ok(request)
 }
 
-pub fn build_dns_response_from_cache(mut request: Message, domain: &str, entries: &[(IpAddr, u32)]) -> Result<Message, String> {
-    let name = Name::from_str(domain).map_err(|e| e.to_string())?;
+pub fn build_dns_response_from_cache(mut request: Message, domain: &str, records: &[DnsRecord]) -> Result<Message, String> {
+    let domain_name = Name::from_str(domain).map_err(|e| e.to_string())?;
     request.set_message_type(MessageType::Response);
-    for &(ip, ttl) in entries {
-        let record = match ip {
-            IpAddr::V4(v4) => Record::from_rdata(name.clone(), ttl, RData::A(A(v4))),
-            IpAddr::V6(v6) => Record::from_rdata(name.clone(), ttl, RData::AAAA(AAAA(v6))),
-        };
-        request.add_answer(record);
+
+    // Track the last CNAME target so A/AAAA records use the correct owner name
+    let mut last_cname_target: Option<Name> = None;
+
+    for record in records {
+        match record {
+            DnsRecord::Cname(from, to, ttl) => {
+                let from_name = Name::from_str(from).map_err(|e| e.to_string())?;
+                let to_name = Name::from_str(to).map_err(|e| e.to_string())?;
+                let rr = Record::from_rdata(from_name, *ttl, RData::CNAME(CNAME(to_name.clone())));
+                request.add_answer(rr);
+                last_cname_target = Some(to_name);
+            }
+            DnsRecord::A(addr, ttl) => {
+                let owner = last_cname_target.as_ref().unwrap_or(&domain_name).clone();
+                let rr = Record::from_rdata(owner, *ttl, RData::A(A(*addr)));
+                request.add_answer(rr);
+            }
+            DnsRecord::AAAA(addr, ttl) => {
+                let owner = last_cname_target.as_ref().unwrap_or(&domain_name).clone();
+                let rr = Record::from_rdata(owner, *ttl, RData::AAAA(AAAA(*addr)));
+                request.add_answer(rr);
+            }
+        }
     }
     Ok(request)
 }
@@ -74,17 +93,20 @@ pub fn extract_ipaddr_from_dns_message(message: &Message) -> Result<IpAddr, Stri
     Err(format!("{:?}", message.answers()))
 }
 
-pub fn extract_ip_ttl_pairs_from_dns_message(message: &Message) -> Vec<(IpAddr, u32)> {
+/// Extract all supported DNS records (A, AAAA, CNAME) from a response message.
+pub fn extract_dns_records_from_message(message: &Message) -> Vec<DnsRecord> {
     message
         .answers()
         .iter()
-        .filter_map(|answer| {
-            let ip = match answer.data() {
-                RData::A(addr) => Some(IpAddr::V4((*addr).into())),
-                RData::AAAA(addr) => Some(IpAddr::V6((*addr).into())),
-                _ => None,
-            };
-            ip.map(|ip| (ip, answer.ttl()))
+        .filter_map(|answer| match answer.data() {
+            RData::A(addr) => Some(DnsRecord::A((*addr).into(), answer.ttl())),
+            RData::AAAA(addr) => Some(DnsRecord::AAAA((*addr).into(), answer.ttl())),
+            RData::CNAME(target) => {
+                let from = answer.name().to_utf8();
+                let to = target.to_utf8();
+                Some(DnsRecord::Cname(from, to, answer.ttl()))
+            }
+            _ => None,
         })
         .collect()
 }

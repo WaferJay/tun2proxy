@@ -8,7 +8,13 @@ fn test_insert_and_lookup() {
     let mut cache = DnsCache::new();
     let ip1 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
     let ip2 = IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8));
-    cache.insert("example.com", &[(ip1, 300), (ip2, 300)]);
+    cache.insert(
+        "example.com",
+        &[
+            DnsRecord::A(Ipv4Addr::new(1, 2, 3, 4), 300),
+            DnsRecord::A(Ipv4Addr::new(5, 6, 7, 8), 300),
+        ],
+    );
 
     assert_eq!(cache.lookup_domains(&ip1).unwrap()[0], "example.com");
     assert_eq!(cache.lookup_domains(&ip2).unwrap()[0], "example.com");
@@ -25,7 +31,7 @@ fn test_lookup_missing() {
 fn test_insert_normalizes_trailing_dot() {
     let mut cache = DnsCache::new();
     let ip = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
-    cache.insert("example.com.", &[(ip, 300)]);
+    cache.insert("example.com.", &[DnsRecord::A(Ipv4Addr::new(1, 1, 1, 1), 300)]);
 
     assert_eq!(cache.lookup_domains(&ip).unwrap()[0], "example.com");
 }
@@ -34,7 +40,7 @@ fn test_insert_normalizes_trailing_dot() {
 fn test_insert_normalizes_case() {
     let mut cache = DnsCache::new();
     let ip = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
-    cache.insert("Example.COM", &[(ip, 300)]);
+    cache.insert("Example.COM", &[DnsRecord::A(Ipv4Addr::new(1, 1, 1, 1), 300)]);
 
     assert_eq!(cache.lookup_domains(&ip).unwrap()[0], "example.com");
 }
@@ -44,8 +50,8 @@ fn test_insert_multiple_domains_same_ip() {
     let mut cache = DnsCache::new();
     let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
 
-    cache.insert("old.com", &[(ip, 300)]);
-    cache.insert("new.com", &[(ip, 300)]);
+    cache.insert("old.com", &[DnsRecord::A(Ipv4Addr::new(1, 2, 3, 4), 300)]);
+    cache.insert("new.com", &[DnsRecord::A(Ipv4Addr::new(1, 2, 3, 4), 300)]);
 
     // Both domains should be visible, newest first
     let domains = cache.lookup_domains(&ip).unwrap();
@@ -58,7 +64,10 @@ fn test_insert_multiple_domains_same_ip() {
 fn test_insert_ipv6() {
     let mut cache = DnsCache::new();
     let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
-    cache.insert("v6.example.com", &[(ip, 300)]);
+    cache.insert(
+        "v6.example.com",
+        &[DnsRecord::AAAA(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 300)],
+    );
 
     assert_eq!(cache.lookup_domains(&ip).unwrap()[0], "v6.example.com");
 }
@@ -70,7 +79,13 @@ fn test_lookup_ips_basic() {
     let mut cache = DnsCache::new();
     let ip1 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
     let ip2 = IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8));
-    cache.insert("example.com", &[(ip1, 300), (ip2, 300)]);
+    cache.insert(
+        "example.com",
+        &[
+            DnsRecord::A(Ipv4Addr::new(1, 2, 3, 4), 300),
+            DnsRecord::A(Ipv4Addr::new(5, 6, 7, 8), 300),
+        ],
+    );
 
     let ips = cache.lookup_ips("example.com").unwrap();
     assert_eq!(ips.len(), 2);
@@ -87,8 +102,7 @@ fn test_lookup_ips_missing() {
 #[test]
 fn test_lookup_ips_normalizes_domain() {
     let mut cache = DnsCache::new();
-    let ip = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
-    cache.insert("Example.COM.", &[(ip, 300)]);
+    cache.insert("Example.COM.", &[DnsRecord::A(Ipv4Addr::new(1, 1, 1, 1), 300)]);
 
     assert!(cache.lookup_ips("example.com").is_some());
     assert!(cache.lookup_ips("Example.COM.").is_some());
@@ -101,7 +115,7 @@ fn test_insert_with_ttl() {
     let mut cache = DnsCache::new();
     let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
     // Insert with a 60-second TTL (within [10, 3600] range)
-    cache.insert("example.com", &[(ip, 60)]);
+    cache.insert("example.com", &[DnsRecord::A(Ipv4Addr::new(10, 0, 0, 1), 60)]);
 
     assert!(cache.lookup_ips("example.com").is_some());
     assert!(cache.lookup_domains(&ip).is_some());
@@ -110,10 +124,14 @@ fn test_insert_with_ttl() {
 #[test]
 fn test_insert_with_different_ttls() {
     let mut cache = DnsCache::new();
-    let ip1 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-    let ip2 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
     // Different TTLs for different IPs
-    cache.insert("example.com", &[(ip1, 30), (ip2, 600)]);
+    cache.insert(
+        "example.com",
+        &[
+            DnsRecord::A(Ipv4Addr::new(10, 0, 0, 1), 30),
+            DnsRecord::A(Ipv4Addr::new(10, 0, 0, 2), 600),
+        ],
+    );
 
     let ips = cache.lookup_ips("example.com").unwrap();
     assert_eq!(ips.len(), 2);
@@ -146,7 +164,7 @@ fn test_evict_expired_no_crash_on_empty() {
 fn test_evict_expired_keeps_valid_entries() {
     let mut cache = DnsCache::new();
     let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-    cache.insert("example.com", &[(ip, 300)]);
+    cache.insert("example.com", &[DnsRecord::A(Ipv4Addr::new(1, 2, 3, 4), 300)]);
 
     cache.evict_expired();
 
@@ -365,17 +383,23 @@ fn test_matches_all_single_domain() {
 #[test]
 fn test_lookup_with_ttl_basic() {
     let mut cache = DnsCache::new();
-    let ip1 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-    let ip2 = IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8));
-    cache.insert("example.com", &[(ip1, 300), (ip2, 600)]);
+    cache.insert(
+        "example.com",
+        &[
+            DnsRecord::A(Ipv4Addr::new(1, 2, 3, 4), 300),
+            DnsRecord::A(Ipv4Addr::new(5, 6, 7, 8), 600),
+        ],
+    );
 
     let results = cache.lookup_with_ttl("example.com").unwrap();
-    assert_eq!(results.len(), 2);
-    assert_eq!(results[0].0, ip1);
-    assert_eq!(results[1].0, ip2);
-    // TTLs should be close to what was inserted (clamped to [10, 3600])
-    assert!(results[0].1 > 0);
-    assert!(results[1].1 > 0);
+    // Filter to A/AAAA only for count
+    let ip_records: Vec<_> = results
+        .iter()
+        .filter(|r| matches!(r, DnsRecord::A(..) | DnsRecord::AAAA(..)))
+        .collect();
+    assert_eq!(ip_records.len(), 2);
+    assert!(matches!(ip_records[0], DnsRecord::A(addr, _) if *addr == Ipv4Addr::new(1, 2, 3, 4)));
+    assert!(matches!(ip_records[1], DnsRecord::A(addr, _) if *addr == Ipv4Addr::new(5, 6, 7, 8)));
 }
 
 #[test]
@@ -387,8 +411,7 @@ fn test_lookup_with_ttl_missing_domain() {
 #[test]
 fn test_lookup_with_ttl_normalizes_domain() {
     let mut cache = DnsCache::new();
-    let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-    cache.insert("Example.COM.", &[(ip, 300)]);
+    cache.insert("Example.COM.", &[DnsRecord::A(Ipv4Addr::new(10, 0, 0, 1), 300)]);
 
     // Various forms should all resolve
     assert!(cache.lookup_with_ttl("example.com").is_some());
@@ -399,25 +422,182 @@ fn test_lookup_with_ttl_normalizes_domain() {
 #[test]
 fn test_lookup_with_ttl_mixed_v4_v6() {
     let mut cache = DnsCache::new();
-    let v4 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-    let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
-    cache.insert("dual.example.com", &[(v4, 60), (v6, 120)]);
+    let v4 = Ipv4Addr::new(1, 2, 3, 4);
+    let v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+    cache.insert("dual.example.com", &[DnsRecord::A(v4, 60), DnsRecord::AAAA(v6, 120)]);
 
     let results = cache.lookup_with_ttl("dual.example.com").unwrap();
-    assert_eq!(results.len(), 2);
-    assert_eq!(results[0].0, v4);
-    assert_eq!(results[1].0, v6);
+    let ip_records: Vec<_> = results
+        .iter()
+        .filter(|r| matches!(r, DnsRecord::A(..) | DnsRecord::AAAA(..)))
+        .collect();
+    assert_eq!(ip_records.len(), 2);
+    assert!(matches!(ip_records[0], DnsRecord::A(addr, _) if *addr == v4));
+    assert!(matches!(ip_records[1], DnsRecord::AAAA(addr, _) if *addr == v6));
 }
 
 #[test]
 fn test_lookup_with_ttl_returns_remaining_ttl() {
     let mut cache = DnsCache::new();
-    let ip = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
-    cache.insert("example.com", &[(ip, 300)]);
+    cache.insert("example.com", &[DnsRecord::A(Ipv4Addr::new(1, 1, 1, 1), 300)]);
 
     let results = cache.lookup_with_ttl("example.com").unwrap();
-    // The remaining TTL should be <= the original clamped TTL
-    // and > 0 since we just inserted it
-    assert!(results[0].1 > 0);
-    assert!(results[0].1 <= 300);
+    let a_record = results.iter().find(|r| matches!(r, DnsRecord::A(..))).unwrap();
+    if let DnsRecord::A(_, ttl) = a_record {
+        // The remaining TTL should be <= the original clamped TTL
+        // and > 0 since we just inserted it
+        assert!(*ttl > 0);
+        assert!(*ttl <= 300);
+    }
+}
+
+// --- CNAME-specific tests ---
+
+#[test]
+fn test_insert_with_cname() {
+    let mut cache = DnsCache::new();
+    cache.insert(
+        "www.example.com",
+        &[
+            DnsRecord::Cname("www.example.com".into(), "cdn.example.com".into(), 300),
+            DnsRecord::A(Ipv4Addr::new(1, 2, 3, 4), 60),
+        ],
+    );
+
+    // lookup_with_ttl should return both CNAME and A records
+    let results = cache.lookup_with_ttl("www.example.com").unwrap();
+    assert!(results.iter().any(|r| matches!(r, DnsRecord::Cname(..))));
+    assert!(results.iter().any(|r| matches!(r, DnsRecord::A(..))));
+}
+
+#[test]
+fn test_lookup_ips_ignores_cname() {
+    let mut cache = DnsCache::new();
+    cache.insert(
+        "www.example.com",
+        &[
+            DnsRecord::Cname("www.example.com".into(), "cdn.example.com".into(), 300),
+            DnsRecord::A(Ipv4Addr::new(1, 2, 3, 4), 60),
+        ],
+    );
+
+    // lookup_ips should only return IP addresses, not CNAME
+    let ips = cache.lookup_ips("www.example.com").unwrap();
+    assert_eq!(ips.len(), 1);
+    assert_eq!(ips[0], IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+}
+
+#[test]
+fn test_reverse_lookup_includes_cname_domains() {
+    let mut cache = DnsCache::new();
+    cache.insert(
+        "www.example.com",
+        &[
+            DnsRecord::Cname("www.example.com".into(), "cdn.example.com".into(), 300),
+            DnsRecord::A(Ipv4Addr::new(1, 2, 3, 4), 60),
+        ],
+    );
+
+    // Reverse lookup should include the query domain (www.example.com)
+    let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+    let domains = cache.lookup_domains(&ip).unwrap();
+    assert!(domains.contains(&"www.example.com"));
+}
+
+#[test]
+fn test_reverse_lookup_includes_distinct_cname_from_domain() {
+    let mut cache = DnsCache::new();
+    // Simulate a case where CNAME from is different from the query domain
+    // (e.g., a multi-level CNAME chain stored under the original query domain)
+    cache.insert(
+        "app.example.com",
+        &[
+            DnsRecord::Cname("app.example.com".into(), "lb.example.com".into(), 300),
+            DnsRecord::Cname("lb.example.com".into(), "cdn.example.com".into(), 300),
+            DnsRecord::A(Ipv4Addr::new(10, 0, 0, 1), 60),
+        ],
+    );
+
+    let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let domains = cache.lookup_domains(&ip).unwrap();
+    // Should include the query domain and both CNAME from domains
+    assert!(domains.contains(&"app.example.com"));
+    assert!(domains.contains(&"lb.example.com"));
+}
+
+#[test]
+fn test_evict_expired_with_cname() {
+    let mut cache = DnsCache::new();
+    cache.insert(
+        "www.example.com",
+        &[
+            DnsRecord::Cname("www.example.com".into(), "cdn.example.com".into(), 300),
+            DnsRecord::A(Ipv4Addr::new(1, 2, 3, 4), 300),
+        ],
+    );
+
+    // Before eviction, everything should be present
+    assert!(cache.lookup_with_ttl("www.example.com").is_some());
+
+    // Evict — nothing expired yet, should keep entries
+    cache.evict_expired();
+    assert!(cache.lookup_with_ttl("www.example.com").is_some());
+}
+
+#[test]
+fn test_lookup_with_ttl_cname_only_returns_none() {
+    let mut cache = DnsCache::new();
+    // Insert only a CNAME without any A/AAAA record
+    cache.insert(
+        "alias.example.com",
+        &[DnsRecord::Cname("alias.example.com".into(), "target.example.com".into(), 300)],
+    );
+
+    // CNAME alone is useless — should return None
+    assert!(cache.lookup_with_ttl("alias.example.com").is_none());
+}
+
+#[test]
+fn test_bypass_requires_cname_domain_match() {
+    let mut cache = DnsCache::new();
+    // www.example.com CNAME cdn.otherdomain.com, A 1.2.3.4
+    cache.insert(
+        "www.example.com",
+        &[
+            DnsRecord::Cname("www.example.com".into(), "cdn.otherdomain.com".into(), 300),
+            DnsRecord::A(Ipv4Addr::new(1, 2, 3, 4), 60),
+        ],
+    );
+
+    // Bypass matcher only matches example.com
+    let matcher = BypassMatcher::new(&["example.com".to_string()]);
+    let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+    let domains = cache.lookup_domains(&ip).unwrap();
+
+    // www.example.com matches, but if cdn.otherdomain.com were also in the
+    // reverse map, matches_all would fail. In this implementation, only the
+    // query domain and CNAME from domains are added (not CNAME targets),
+    // so "www.example.com" is the only domain → bypass succeeds.
+    assert!(matcher.matches_all(&domains));
+}
+
+#[test]
+fn test_bypass_fails_when_cname_from_doesnt_match() {
+    let mut cache = DnsCache::new();
+    // Simulate: the CNAME from domain is different and doesn't match bypass rules
+    cache.insert(
+        "evil.org",
+        &[
+            DnsRecord::Cname("evil.org".into(), "cdn.example.com".into(), 300),
+            DnsRecord::A(Ipv4Addr::new(1, 2, 3, 4), 60),
+        ],
+    );
+
+    // Bypass matcher only matches example.com
+    let matcher = BypassMatcher::new(&["example.com".to_string()]);
+    let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+    let domains = cache.lookup_domains(&ip).unwrap();
+
+    // "evil.org" is a domain associated with this IP → does not match → no bypass
+    assert!(!matcher.matches_all(&domains));
 }

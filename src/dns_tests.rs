@@ -1,9 +1,10 @@
 use super::*;
+use crate::dns_mapping::DnsRecord;
 use hickory_proto::{
     op::{Message, MessageType, OpCode, Query},
     rr::{
         Name, RData, Record, RecordType,
-        rdata::{A, AAAA},
+        rdata::{A, AAAA, CNAME},
     },
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -162,7 +163,7 @@ fn test_full_dns_flow_simulation() {
     // 3. Client parses response (same as tun2proxy snooping)
     let parsed = parse_data_to_dns_message(&resp_bytes, false).unwrap();
     let name = extract_domain_from_dns_message(&parsed).unwrap();
-    let pairs = extract_ip_ttl_pairs_from_dns_message(&parsed);
+    let pairs = extract_ip_ttl_pairs(&parsed);
 
     assert!(name.trim_end_matches('.') == domain);
     assert_eq!(pairs.len(), 1);
@@ -203,48 +204,20 @@ fn build_test_response_with_ttls(domain: &str, entries: &[(IpAddr, u32)]) -> Mes
     msg
 }
 
-// ── extract_ip_ttl_pairs tests ──────────────────────────────────────
-
-#[test]
-fn test_extract_ip_ttl_pairs_basic() {
-    let ip1 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-    let ip2 = IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8));
-    let msg = build_test_response_with_ttls("example.com", &[(ip1, 60), (ip2, 120)]);
-
-    let pairs = extract_ip_ttl_pairs_from_dns_message(&msg);
-    assert_eq!(pairs.len(), 2);
-    assert_eq!(pairs[0], (ip1, 60));
-    assert_eq!(pairs[1], (ip2, 120));
-}
-
-#[test]
-fn test_extract_ip_ttl_pairs_mixed_v4_v6() {
-    let v4 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-    let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
-    let msg = build_test_response_with_ttls("example.com", &[(v4, 30), (v6, 600)]);
-
-    let pairs = extract_ip_ttl_pairs_from_dns_message(&msg);
-    assert_eq!(pairs.len(), 2);
-    assert_eq!(pairs[0], (v4, 30));
-    assert_eq!(pairs[1], (v6, 600));
-}
-
-#[test]
-fn test_extract_ip_ttl_pairs_empty() {
-    let msg = build_test_response("example.com", &[]);
-    let pairs = extract_ip_ttl_pairs_from_dns_message(&msg);
-    assert!(pairs.is_empty());
-}
-
-#[test]
-fn test_extract_ip_ttl_pairs_uses_existing_helper() {
-    // Verify TTL=300 from the standard build_test_response helper
-    let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-    let msg = build_test_response("example.com", &[ip]);
-
-    let pairs = extract_ip_ttl_pairs_from_dns_message(&msg);
-    assert_eq!(pairs.len(), 1);
-    assert_eq!(pairs[0], (ip, 300));
+/// Test helper: extract (IP, TTL) pairs from a DNS response message's answer section.
+fn extract_ip_ttl_pairs(message: &Message) -> Vec<(IpAddr, u32)> {
+    message
+        .answers()
+        .iter()
+        .filter_map(|answer| {
+            let ip = match answer.data() {
+                RData::A(addr) => Some(IpAddr::V4((*addr).into())),
+                RData::AAAA(addr) => Some(IpAddr::V6((*addr).into())),
+                _ => None,
+            };
+            ip.map(|ip| (ip, answer.ttl()))
+        })
+        .collect()
 }
 
 #[test]
@@ -290,7 +263,7 @@ fn test_remove_ipv6_entries_keeps_v4() {
     remove_ipv6_entries(&mut msg);
     assert_eq!(msg.answers().len(), 1);
 
-    let pairs = extract_ip_ttl_pairs_from_dns_message(&msg);
+    let pairs = extract_ip_ttl_pairs(&msg);
     assert_eq!(pairs.len(), 1);
     assert_eq!(pairs[0].0, v4);
 }
@@ -303,7 +276,7 @@ fn test_parse_data_roundtrip() {
     let parsed = parse_data_to_dns_message(&bytes, false).unwrap();
 
     assert_eq!(parsed.id(), original.id());
-    let pairs = extract_ip_ttl_pairs_from_dns_message(&parsed);
+    let pairs = extract_ip_ttl_pairs(&parsed);
     assert_eq!(pairs.len(), 1);
     assert_eq!(pairs[0].0, ip);
 }
@@ -315,17 +288,16 @@ fn test_build_dns_response_from_cache_single_v4() {
     let query_bytes = build_dns_query("example.com", 0x1111).unwrap();
     let query_msg = parse_data_to_dns_message(&query_bytes, false).unwrap();
 
-    let ip = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
-    let entries = vec![(ip, 120)];
-    let response = build_dns_response_from_cache(query_msg, "example.com.", &entries).unwrap();
+    let records = vec![DnsRecord::A(Ipv4Addr::new(93, 184, 216, 34), 120)];
+    let response = build_dns_response_from_cache(query_msg, "example.com.", &records).unwrap();
 
     assert_eq!(response.id(), 0x1111);
     assert_eq!(response.message_type(), MessageType::Response);
     assert_eq!(response.answers().len(), 1);
 
-    let pairs = extract_ip_ttl_pairs_from_dns_message(&response);
+    let pairs = extract_ip_ttl_pairs(&response);
     assert_eq!(pairs.len(), 1);
-    assert_eq!(pairs[0].0, ip);
+    assert_eq!(pairs[0].0, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
     assert_eq!(pairs[0].1, 120);
 }
 
@@ -334,15 +306,16 @@ fn test_build_dns_response_from_cache_multiple_records() {
     let query_bytes = build_dns_query("example.com", 0x2222).unwrap();
     let query_msg = parse_data_to_dns_message(&query_bytes, false).unwrap();
 
-    let ip1 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-    let ip2 = IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8));
-    let entries = vec![(ip1, 60), (ip2, 300)];
-    let response = build_dns_response_from_cache(query_msg, "example.com.", &entries).unwrap();
+    let records = vec![
+        DnsRecord::A(Ipv4Addr::new(1, 2, 3, 4), 60),
+        DnsRecord::A(Ipv4Addr::new(5, 6, 7, 8), 300),
+    ];
+    let response = build_dns_response_from_cache(query_msg, "example.com.", &records).unwrap();
 
     assert_eq!(response.answers().len(), 2);
-    let pairs = extract_ip_ttl_pairs_from_dns_message(&response);
-    assert_eq!(pairs[0], (ip1, 60));
-    assert_eq!(pairs[1], (ip2, 300));
+    let pairs = extract_ip_ttl_pairs(&response);
+    assert_eq!(pairs[0], (IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 60));
+    assert_eq!(pairs[1], (IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)), 300));
 }
 
 #[test]
@@ -350,15 +323,15 @@ fn test_build_dns_response_from_cache_mixed_v4_v6() {
     let query_bytes = build_dns_query("dual.example.com", 0x3333).unwrap();
     let query_msg = parse_data_to_dns_message(&query_bytes, false).unwrap();
 
-    let v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-    let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
-    let entries = vec![(v4, 200), (v6, 400)];
-    let response = build_dns_response_from_cache(query_msg, "dual.example.com.", &entries).unwrap();
+    let v4 = Ipv4Addr::new(10, 0, 0, 1);
+    let v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+    let records = vec![DnsRecord::A(v4, 200), DnsRecord::AAAA(v6, 400)];
+    let response = build_dns_response_from_cache(query_msg, "dual.example.com.", &records).unwrap();
 
     assert_eq!(response.answers().len(), 2);
-    let pairs = extract_ip_ttl_pairs_from_dns_message(&response);
-    assert_eq!(pairs[0].0, v4);
-    assert_eq!(pairs[1].0, v6);
+    let pairs = extract_ip_ttl_pairs(&response);
+    assert_eq!(pairs[0].0, IpAddr::V4(v4));
+    assert_eq!(pairs[1].0, IpAddr::V6(v6));
 }
 
 #[test]
@@ -366,8 +339,8 @@ fn test_build_dns_response_from_cache_empty_entries() {
     let query_bytes = build_dns_query("example.com", 0x4444).unwrap();
     let query_msg = parse_data_to_dns_message(&query_bytes, false).unwrap();
 
-    let entries: Vec<(IpAddr, u32)> = vec![];
-    let response = build_dns_response_from_cache(query_msg, "example.com.", &entries).unwrap();
+    let records: Vec<DnsRecord> = vec![];
+    let response = build_dns_response_from_cache(query_msg, "example.com.", &records).unwrap();
 
     assert_eq!(response.message_type(), MessageType::Response);
     assert!(response.answers().is_empty());
@@ -378,8 +351,8 @@ fn test_build_dns_response_from_cache_preserves_query_id() {
     let query_bytes = build_dns_query("test.com", 0xBEEF).unwrap();
     let query_msg = parse_data_to_dns_message(&query_bytes, false).unwrap();
 
-    let ip = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
-    let response = build_dns_response_from_cache(query_msg, "test.com.", &[(ip, 60)]).unwrap();
+    let records = vec![DnsRecord::A(Ipv4Addr::new(1, 1, 1, 1), 60)];
+    let response = build_dns_response_from_cache(query_msg, "test.com.", &records).unwrap();
 
     assert_eq!(response.id(), 0xBEEF);
     // Verify it roundtrips through serialization
@@ -393,15 +366,128 @@ fn test_build_dns_response_from_cache_with_ipv6_removal() {
     let query_bytes = build_dns_query("example.com", 0x5555).unwrap();
     let query_msg = parse_data_to_dns_message(&query_bytes, false).unwrap();
 
-    let v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-    let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
-    let entries = vec![(v4, 200), (v6, 400)];
-    let mut response = build_dns_response_from_cache(query_msg, "example.com.", &entries).unwrap();
+    let v4 = Ipv4Addr::new(10, 0, 0, 1);
+    let v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+    let records = vec![DnsRecord::A(v4, 200), DnsRecord::AAAA(v6, 400)];
+    let mut response = build_dns_response_from_cache(query_msg, "example.com.", &records).unwrap();
 
     // Simulate what try_resolve_from_cache does when ipv6_enabled=false
     remove_ipv6_entries(&mut response);
     assert_eq!(response.answers().len(), 1);
 
-    let pairs = extract_ip_ttl_pairs_from_dns_message(&response);
-    assert_eq!(pairs[0].0, v4);
+    let pairs = extract_ip_ttl_pairs(&response);
+    assert_eq!(pairs[0].0, IpAddr::V4(v4));
+}
+
+// ── extract_dns_records_from_message tests ──────────────────────────
+
+fn build_test_response_with_cname(domain: &str, cname_target: &str, ips: &[(IpAddr, u32)]) -> Message {
+    let name = Name::from_str(domain).unwrap();
+    let target_name = Name::from_str(cname_target).unwrap();
+    let query = Query::query(name.clone(), RecordType::A);
+    let mut msg = Message::new();
+    msg.set_id(1234);
+    msg.set_message_type(MessageType::Response);
+    msg.add_query(query);
+
+    // Add CNAME record
+    let cname_record = Record::from_rdata(name, 300, RData::CNAME(CNAME(target_name.clone())));
+    msg.add_answer(cname_record);
+
+    // Add A/AAAA records with CNAME target as owner
+    for (ip, ttl) in ips {
+        let record = match ip {
+            IpAddr::V4(v4) => Record::from_rdata(target_name.clone(), *ttl, RData::A(A(*v4))),
+            IpAddr::V6(v6) => Record::from_rdata(target_name.clone(), *ttl, RData::AAAA(AAAA(*v6))),
+        };
+        msg.add_answer(record);
+    }
+    msg
+}
+
+#[test]
+fn test_extract_dns_records_with_cname() {
+    let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+    let msg = build_test_response_with_cname("www.example.com", "cdn.example.com", &[(ip, 60)]);
+
+    let records = extract_dns_records_from_message(&msg);
+    assert_eq!(records.len(), 2);
+
+    // First record should be the CNAME
+    match &records[0] {
+        DnsRecord::Cname(from, to, ttl) => {
+            assert!(from.trim_end_matches('.') == "www.example.com");
+            assert!(to.trim_end_matches('.') == "cdn.example.com");
+            assert_eq!(*ttl, 300);
+        }
+        _ => panic!("Expected CNAME record"),
+    }
+
+    // Second should be A
+    match &records[1] {
+        DnsRecord::A(addr, ttl) => {
+            assert_eq!(*addr, Ipv4Addr::new(1, 2, 3, 4));
+            assert_eq!(*ttl, 60);
+        }
+        _ => panic!("Expected A record"),
+    }
+}
+
+#[test]
+fn test_extract_dns_records_no_cname() {
+    let ip1 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+    let ip2 = IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8));
+    let msg = build_test_response_with_ttls("example.com", &[(ip1, 60), (ip2, 120)]);
+
+    let records = extract_dns_records_from_message(&msg);
+    assert_eq!(records.len(), 2);
+    assert!(matches!(&records[0], DnsRecord::A(addr, 60) if *addr == Ipv4Addr::new(1, 2, 3, 4)));
+    assert!(matches!(&records[1], DnsRecord::A(addr, 120) if *addr == Ipv4Addr::new(5, 6, 7, 8)));
+}
+
+#[test]
+fn test_extract_dns_records_empty() {
+    let msg = build_test_response("example.com", &[]);
+    let records = extract_dns_records_from_message(&msg);
+    assert!(records.is_empty());
+}
+
+#[test]
+fn test_build_response_from_cache_with_cname() {
+    let query_bytes = build_dns_query("www.example.com", 0x6666).unwrap();
+    let query_msg = parse_data_to_dns_message(&query_bytes, false).unwrap();
+
+    let records = vec![
+        DnsRecord::Cname("www.example.com".into(), "cdn.example.com".into(), 300),
+        DnsRecord::A(Ipv4Addr::new(1, 2, 3, 4), 60),
+    ];
+    let response = build_dns_response_from_cache(query_msg, "www.example.com.", &records).unwrap();
+
+    assert_eq!(response.answers().len(), 2);
+
+    // First answer should be CNAME
+    let first = &response.answers()[0];
+    assert!(matches!(first.data(), RData::CNAME(_)));
+
+    // Second answer should be A with owner = cdn.example.com (CNAME target)
+    let second = &response.answers()[1];
+    assert!(matches!(second.data(), RData::A(_)));
+    assert!(second.name().to_utf8().trim_end_matches('.') == "cdn.example.com");
+
+    // Should still be able to extract the IP
+    let ip = extract_ipaddr_from_dns_message(&response).unwrap();
+    assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+}
+
+#[test]
+fn test_build_response_from_cache_without_cname_uses_domain() {
+    let query_bytes = build_dns_query("example.com", 0x7777).unwrap();
+    let query_msg = parse_data_to_dns_message(&query_bytes, false).unwrap();
+
+    let records = vec![DnsRecord::A(Ipv4Addr::new(1, 2, 3, 4), 60)];
+    let response = build_dns_response_from_cache(query_msg, "example.com.", &records).unwrap();
+
+    assert_eq!(response.answers().len(), 1);
+    let answer = &response.answers()[0];
+    assert!(answer.name().to_utf8().trim_end_matches('.') == "example.com");
 }

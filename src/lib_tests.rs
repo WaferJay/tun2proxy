@@ -1,9 +1,27 @@
 use super::*;
 use crate::directions::{IncomingDataEvent, OutgoingDataEvent, OutgoingDirection};
+use crate::dns_mapping::DnsRecord;
 use crate::proxy_handler::ProxyHandler;
 use crate::session_info::{IpProtocol, SessionInfo};
+use hickory_proto::rr::RData;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use tokio::net::TcpListener;
+
+/// Test helper: extract (IP, TTL) pairs from a DNS response message's answer section.
+fn extract_ip_ttl_pairs(message: &hickory_proto::op::Message) -> Vec<(IpAddr, u32)> {
+    message
+        .answers()
+        .iter()
+        .filter_map(|answer| {
+            let ip = match answer.data() {
+                RData::A(addr) => Some(IpAddr::V4((*addr).into())),
+                RData::AAAA(addr) => Some(IpAddr::V6((*addr).into())),
+                _ => None,
+            };
+            ip.map(|ip| (ip, answer.ttl()))
+        })
+        .collect()
+}
 
 /// Mock ProxyHandler for testing handle_proxy_session's ProxyResult mapping.
 ///
@@ -163,7 +181,10 @@ fn make_shared_dns_cache() -> dns_mapping::SharedDnsCache {
 async fn test_try_resolve_from_cache_hit() {
     let cache = make_shared_dns_cache();
     let ip = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
-    cache.lock().await.insert("example.com", &[(ip, 300)]);
+    cache
+        .lock()
+        .await
+        .insert("example.com", &[DnsRecord::A(Ipv4Addr::new(93, 184, 216, 34), 300)]);
 
     let query = dns::build_dns_query("example.com", 0xABCD).unwrap();
     let result = try_resolve_from_cache(&query, &cache, true).await;
@@ -189,8 +210,10 @@ async fn test_try_resolve_from_cache_miss() {
 #[tokio::test]
 async fn test_try_resolve_from_cache_miss_different_domain() {
     let cache = make_shared_dns_cache();
-    let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-    cache.lock().await.insert("other.com", &[(ip, 300)]);
+    cache
+        .lock()
+        .await
+        .insert("other.com", &[DnsRecord::A(Ipv4Addr::new(1, 2, 3, 4), 300)]);
 
     // Query for a domain not in cache
     let query = dns::build_dns_query("example.com", 0x5678).unwrap();
@@ -201,8 +224,10 @@ async fn test_try_resolve_from_cache_miss_different_domain() {
 #[tokio::test]
 async fn test_try_resolve_from_cache_ipv6_disabled_v4_only() {
     let cache = make_shared_dns_cache();
-    let v4 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-    cache.lock().await.insert("example.com", &[(v4, 300)]);
+    cache
+        .lock()
+        .await
+        .insert("example.com", &[DnsRecord::A(Ipv4Addr::new(1, 2, 3, 4), 300)]);
 
     let query = dns::build_dns_query("example.com", 0x1111).unwrap();
     let result = try_resolve_from_cache(&query, &cache, false).await;
@@ -216,8 +241,10 @@ async fn test_try_resolve_from_cache_ipv6_disabled_v4_only() {
 #[tokio::test]
 async fn test_try_resolve_from_cache_ipv6_disabled_v6_only() {
     let cache = make_shared_dns_cache();
-    let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
-    cache.lock().await.insert("example.com", &[(v6, 300)]);
+    cache.lock().await.insert(
+        "example.com",
+        &[DnsRecord::AAAA(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 300)],
+    );
 
     let query = dns::build_dns_query("example.com", 0x2222).unwrap();
     let result = try_resolve_from_cache(&query, &cache, false).await;
@@ -230,8 +257,13 @@ async fn test_try_resolve_from_cache_ipv6_disabled_v6_only() {
 async fn test_try_resolve_from_cache_ipv6_disabled_mixed() {
     let cache = make_shared_dns_cache();
     let v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-    let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
-    cache.lock().await.insert("dual.example.com", &[(v4, 300), (v6, 300)]);
+    cache.lock().await.insert(
+        "dual.example.com",
+        &[
+            DnsRecord::A(Ipv4Addr::new(10, 0, 0, 1), 300),
+            DnsRecord::AAAA(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 300),
+        ],
+    );
 
     let query = dns::build_dns_query("dual.example.com", 0x3333).unwrap();
     let result = try_resolve_from_cache(&query, &cache, false).await;
@@ -247,9 +279,13 @@ async fn test_try_resolve_from_cache_ipv6_disabled_mixed() {
 #[tokio::test]
 async fn test_try_resolve_from_cache_ipv6_enabled_mixed() {
     let cache = make_shared_dns_cache();
-    let v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-    let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
-    cache.lock().await.insert("dual.example.com", &[(v4, 300), (v6, 300)]);
+    cache.lock().await.insert(
+        "dual.example.com",
+        &[
+            DnsRecord::A(Ipv4Addr::new(10, 0, 0, 1), 300),
+            DnsRecord::AAAA(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 300),
+        ],
+    );
 
     let query = dns::build_dns_query("dual.example.com", 0x4444).unwrap();
     let result = try_resolve_from_cache(&query, &cache, true).await;
@@ -271,8 +307,10 @@ async fn test_try_resolve_from_cache_invalid_data() {
 #[tokio::test]
 async fn test_try_resolve_from_cache_preserves_query_id() {
     let cache = make_shared_dns_cache();
-    let ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
-    cache.lock().await.insert("dns.google", &[(ip, 60)]);
+    cache
+        .lock()
+        .await
+        .insert("dns.google", &[DnsRecord::A(Ipv4Addr::new(8, 8, 8, 8), 60)]);
 
     // Different query IDs should produce responses with matching IDs
     for id in [0x0001, 0x9999, 0xFFFF] {
@@ -286,10 +324,14 @@ async fn test_try_resolve_from_cache_preserves_query_id() {
 #[tokio::test]
 async fn test_try_resolve_from_cache_multiple_v4_records() {
     let cache = make_shared_dns_cache();
-    let ip1 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-    let ip2 = IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8));
-    let ip3 = IpAddr::V4(Ipv4Addr::new(9, 10, 11, 12));
-    cache.lock().await.insert("cdn.example.com", &[(ip1, 60), (ip2, 120), (ip3, 180)]);
+    cache.lock().await.insert(
+        "cdn.example.com",
+        &[
+            DnsRecord::A(Ipv4Addr::new(1, 2, 3, 4), 60),
+            DnsRecord::A(Ipv4Addr::new(5, 6, 7, 8), 120),
+            DnsRecord::A(Ipv4Addr::new(9, 10, 11, 12), 180),
+        ],
+    );
 
     let query = dns::build_dns_query("cdn.example.com", 0x7777).unwrap();
     let result = try_resolve_from_cache(&query, &cache, true).await;
@@ -297,8 +339,37 @@ async fn test_try_resolve_from_cache_multiple_v4_records() {
     assert!(result.is_some());
     let msg = dns::parse_data_to_dns_message(&result.unwrap(), false).unwrap();
     assert_eq!(msg.answers().len(), 3);
-    let pairs = dns::extract_ip_ttl_pairs_from_dns_message(&msg);
-    assert_eq!(pairs[0].0, ip1);
-    assert_eq!(pairs[1].0, ip2);
-    assert_eq!(pairs[2].0, ip3);
+    let pairs = extract_ip_ttl_pairs(&msg);
+    assert_eq!(pairs[0].0, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+    assert_eq!(pairs[1].0, IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)));
+    assert_eq!(pairs[2].0, IpAddr::V4(Ipv4Addr::new(9, 10, 11, 12)));
+}
+
+// --- CNAME-specific cache resolution tests ---
+
+#[tokio::test]
+async fn test_try_resolve_from_cache_with_cname() {
+    let cache = make_shared_dns_cache();
+    cache.lock().await.insert(
+        "www.example.com",
+        &[
+            DnsRecord::Cname("www.example.com".into(), "cdn.example.com".into(), 300),
+            DnsRecord::A(Ipv4Addr::new(1, 2, 3, 4), 60),
+        ],
+    );
+
+    let query = dns::build_dns_query("www.example.com", 0x8888).unwrap();
+    let result = try_resolve_from_cache(&query, &cache, true).await;
+
+    assert!(result.is_some());
+    let msg = dns::parse_data_to_dns_message(&result.unwrap(), false).unwrap();
+    // Should have 2 answers: CNAME + A
+    assert_eq!(msg.answers().len(), 2);
+
+    // First answer should be CNAME
+    assert!(matches!(msg.answers()[0].data(), hickory_proto::rr::RData::CNAME(_)));
+
+    // Should still be able to extract the IP
+    let ip = dns::extract_ipaddr_from_dns_message(&msg).unwrap();
+    assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
 }
