@@ -34,7 +34,7 @@ use udpgw::{UDPGW_KEEPALIVE_TIME, UDPGW_MAX_CONNECTIONS, UdpGwClientStream, UdpG
 pub use {
     args::{ArgDns, ArgProxy, ArgVerbosity, Args, ProxyType},
     error::{BoxError, Error, Result},
-    http::{HttpAuthenticator, HttpManager, PasswordAuthenticator, AuthResult},
+    http::{AuthResult, HttpAuthenticator, HttpManager, PasswordAuthenticator},
     proxy_handler::ProxyHandlerManager,
     traffic_status::{TrafficStatus, tun2proxy_set_traffic_status_callback},
 };
@@ -217,13 +217,11 @@ async fn lookup_domain_name(
     };
     match domain_name {
         Some(name) => Some(name),
-        None => {
-            dns_cache
-                .lock()
-                .await
-                .lookup_domains(ip)
-                .and_then(|domains| domains.first().map(|s| s.to_string()))
-        }
+        None => dns_cache
+            .lock()
+            .await
+            .lookup_domains(ip)
+            .and_then(|domains| domains.first().map(|s| s.to_string())),
     }
 }
 
@@ -253,9 +251,7 @@ async fn check_bypass_ip(
     // DNS cache: one IP may map to multiple domains.
     // Conservative: only bypass when ALL associated domains match.
     let cache = dns_cache.lock().await;
-    cache
-        .lookup_domains(ip)
-        .is_some_and(|domains| bypass_matcher.matches_all(&domains))
+    cache.lookup_domains(ip).is_some_and(|domains| bypass_matcher.matches_all(&domains))
 }
 
 /// When bypassing in Virtual DNS mode, resolve the fake IP to a real address.
@@ -284,11 +280,7 @@ async fn resolve_bypass_destination(
     true
 }
 
-async fn snoop_dns_response(
-    data: &[u8],
-    dns_cache: &dns_mapping::SharedDnsCache,
-    ipv6_enabled: bool,
-) -> crate::Result<Vec<u8>> {
+async fn snoop_dns_response(data: &[u8], dns_cache: &dns_mapping::SharedDnsCache, ipv6_enabled: bool) -> crate::Result<Vec<u8>> {
     let mut message = dns::parse_data_to_dns_message(data, false)?;
     if let Ok(name) = dns::extract_domain_from_dns_message(&message) {
         let entries = dns::extract_ip_ttl_pairs_from_dns_message(&message);
@@ -334,8 +326,7 @@ where
     };
 
     let bypass_matcher = dns_mapping::BypassMatcher::new(&args.bypass_domain);
-    let dns_cache: dns_mapping::SharedDnsCache =
-        Arc::new(Mutex::new(dns_mapping::DnsCache::new()));
+    let dns_cache: dns_mapping::SharedDnsCache = Arc::new(Mutex::new(dns_mapping::DnsCache::new()));
     let no_proxy_mgr: Arc<dyn ProxyHandlerManager> = Arc::new(NoProxyManager::new());
 
     // Periodically evict expired DNS cache entries.
@@ -412,9 +403,8 @@ where
                 ProxyType::Socks5 => Arc::new(SocksProxyManager::new(server_addr, V5, key)),
                 ProxyType::Socks4 => Arc::new(SocksProxyManager::new(server_addr, V4, key)),
                 ProxyType::Http => {
-                    let authenticator: Option<Arc<dyn HttpAuthenticator>> = key.map(|credentials| {
-                        Arc::new(PasswordAuthenticator::new(credentials)) as Arc<dyn HttpAuthenticator>
-                    });
+                    let authenticator: Option<Arc<dyn HttpAuthenticator>> =
+                        key.map(|credentials| Arc::new(PasswordAuthenticator::new(credentials)) as Arc<dyn HttpAuthenticator>);
                     Arc::new(HttpManager::new(server_addr, authenticator))
                 }
                 ProxyType::None => Arc::new(NoProxyManager::new()),
@@ -484,9 +474,9 @@ where
                 let mut should_bypass = check_bypass_ip(&tcp.peer_addr().ip(), &virtual_dns, &dns_cache, &bypass_matcher).await;
 
                 if should_bypass {
-                    should_bypass = resolve_bypass_destination(
-                        &mut info, &domain_name, virtual_dns.is_some(), dns_addr, &socket_queue, &dns_cache,
-                    ).await;
+                    should_bypass =
+                        resolve_bypass_destination(&mut info, &domain_name, virtual_dns.is_some(), dns_addr, &socket_queue, &dns_cache)
+                            .await;
                 }
 
                 let handler_mgr = if should_bypass { &no_proxy_mgr } else { &mgr };
@@ -571,7 +561,9 @@ where
                                 Some(ref d) => socks5_impl::protocol::Address::from((d.clone(), dst.port())),
                                 None => dst.into(),
                             };
-                            if let Err(e) = handle_udp_gateway_session(udp, udpgw, &dst_addr, proxy_handler, queue, ipv6_enabled, dns_cache).await {
+                            if let Err(e) =
+                                handle_udp_gateway_session(udp, udpgw, &dst_addr, proxy_handler, queue, ipv6_enabled, dns_cache).await
+                            {
                                 log::info!("Ending {info} with \"{e}\"");
                             }
                             log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
@@ -581,9 +573,9 @@ where
                 }
 
                 if should_bypass {
-                    should_bypass = resolve_bypass_destination(
-                        &mut info, &domain_name, virtual_dns.is_some(), dns_addr, &socket_queue, &dns_cache,
-                    ).await;
+                    should_bypass =
+                        resolve_bypass_destination(&mut info, &domain_name, virtual_dns.is_some(), dns_addr, &socket_queue, &dns_cache)
+                            .await;
                 }
 
                 let handler_mgr = if should_bypass { &no_proxy_mgr } else { &mgr };
@@ -593,7 +585,9 @@ where
                     Ok(proxy_handler) => {
                         let socket_queue = socket_queue.clone();
                         tokio::spawn(async move {
-                            if let Err(err) = handle_udp_associate_session(udp, ty, proxy_handler, socket_queue, ipv6_enabled, dns_cache).await {
+                            if let Err(err) =
+                                handle_udp_associate_session(udp, ty, proxy_handler, socket_queue, ipv6_enabled, dns_cache).await
+                            {
                                 log::info!("Ending {info} with \"{err}\"");
                             }
                             log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
@@ -639,6 +633,20 @@ async fn handle_virtual_dns_session(mut udp: IpStackUdpStream, dns: Arc<Mutex<Vi
     Ok(())
 }
 
+async fn try_resolve_from_cache(query_data: &[u8], dns_cache: &dns_mapping::SharedDnsCache, ipv6_enabled: bool) -> Option<Vec<u8>> {
+    let message = dns::parse_data_to_dns_message(query_data, false).ok()?;
+    let domain = dns::extract_domain_from_dns_message(&message).ok()?;
+    let entries = dns_cache.lock().await.lookup_with_ttl(&domain)?;
+    let mut response = dns::build_dns_response_from_cache(message, &domain, &entries).ok()?;
+    if !ipv6_enabled {
+        dns::remove_ipv6_entries(&mut response);
+    }
+    if response.answers().is_empty() {
+        return None;
+    }
+    response.to_vec().ok()
+}
+
 async fn handle_direct_dns_session(
     mut udp: IpStackUdpStream,
     dns_addr: SocketAddr,
@@ -658,6 +666,11 @@ async fn handle_direct_dns_session(
                     break;
                 }
                 traffic_status::traffic_status_update(len, 0)?;
+                if let Some(cached) = try_resolve_from_cache(&buf1[..len], &dns_cache, ipv6_enabled).await {
+                    log::debug!("DNS cache hit for direct query");
+                    udp.write_all(&cached).await?;
+                    continue;
+                }
                 dns_server.write_all(&buf1[..len]).await?;
             }
             len = dns_server.read(&mut buf2) => {
@@ -822,6 +835,14 @@ async fn handle_udp_gateway_session(
                     }
                 };
                 crate::traffic_status::traffic_status_update(read_len, 0)?;
+                if udp_dst.port() == DNS_PORT {
+                    if let Some(cached) = try_resolve_from_cache(&tmp_buf[..read_len], &dns_cache, ipv6_enabled).await {
+                        log::debug!("DNS cache hit for udpgw query");
+                        udp_stack.write_all(&cached).await?;
+                        stream.update_activity();
+                        continue;
+                    }
+                }
                 let sn = stream.serial_number();
                 if let Err(e) = UdpGwClient::send_udpgw_packet(ipv6_enabled, &tmp_buf[0..read_len], udp_dst, sn, &mut writer).await {
                     log::info!("[UdpGw] Ending stream {} {} <> {} with send_udpgw_packet {}", sn, &tcp_local_addr, udp_dst, e);
@@ -943,6 +964,14 @@ async fn handle_udp_associate_session(
 
                 crate::traffic_status::traffic_status_update(len, 0)?;
 
+                if session_info.dst.port() == DNS_PORT {
+                    if let Some(cached) = try_resolve_from_cache(buf1, &dns_cache, ipv6_enabled).await {
+                        log::debug!("DNS cache hit for over-proxy query");
+                        udp_stack.write_all(&cached).await?;
+                        continue;
+                    }
+                }
+
                 if let ProxyType::Socks4 | ProxyType::Socks5 = proxy_type {
                     let s5addr = if let Some(domain_name) = &domain_name {
                         Address::DomainAddress(domain_name.clone().into(), session_info.dst.port())
@@ -1036,6 +1065,12 @@ async fn handle_dns_over_tcp_session(
                     }
                 };
                 let udp_data = &udp_recv_buf[..len];
+
+                if let Some(cached) = try_resolve_from_cache(udp_data, &dns_cache, ipv6_enabled).await {
+                    log::debug!("DNS cache hit for over-tcp query");
+                    udp_stack.write_all(&cached).await?;
+                    continue;
+                }
 
                 _ = dns::parse_data_to_dns_message(udp_data, false)?;
 

@@ -262,7 +262,13 @@ pub async fn general_run_async(
         }
     }
 
-    let join_handle = tokio::spawn(crate::run(device, tun_mtu, args.clone(), shutdown_token.clone(), proxy_handler_manager));
+    let join_handle = tokio::spawn(crate::run(
+        device,
+        tun_mtu,
+        args.clone(),
+        shutdown_token.clone(),
+        proxy_handler_manager,
+    ));
 
     match join_handle.await? {
         Ok(sessions) => {

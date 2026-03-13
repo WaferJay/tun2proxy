@@ -308,8 +308,8 @@ fn test_wildcard_pattern_trailing_dot_trimmed() {
 #[test]
 fn test_mixed_suffix_and_wildcard() {
     let list = vec![
-        "github.com".to_string(),    // suffix
-        "*.google.*".to_string(),    // wildcard
+        "github.com".to_string(), // suffix
+        "*.google.*".to_string(), // wildcard
     ];
     let matcher = BypassMatcher::new(&list);
     // suffix path
@@ -358,4 +358,66 @@ fn test_matches_all_single_domain() {
     let matcher = BypassMatcher::new(&["example.com".to_string()]);
     assert!(matcher.matches_all(&["example.com"]));
     assert!(!matcher.matches_all(&["other.com"]));
+}
+
+// --- lookup_with_ttl tests ---
+
+#[test]
+fn test_lookup_with_ttl_basic() {
+    let mut cache = DnsCache::new();
+    let ip1 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+    let ip2 = IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8));
+    cache.insert("example.com", &[(ip1, 300), (ip2, 600)]);
+
+    let results = cache.lookup_with_ttl("example.com").unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].0, ip1);
+    assert_eq!(results[1].0, ip2);
+    // TTLs should be close to what was inserted (clamped to [10, 3600])
+    assert!(results[0].1 > 0);
+    assert!(results[1].1 > 0);
+}
+
+#[test]
+fn test_lookup_with_ttl_missing_domain() {
+    let cache = DnsCache::new();
+    assert!(cache.lookup_with_ttl("nonexistent.com").is_none());
+}
+
+#[test]
+fn test_lookup_with_ttl_normalizes_domain() {
+    let mut cache = DnsCache::new();
+    let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    cache.insert("Example.COM.", &[(ip, 300)]);
+
+    // Various forms should all resolve
+    assert!(cache.lookup_with_ttl("example.com").is_some());
+    assert!(cache.lookup_with_ttl("Example.COM").is_some());
+    assert!(cache.lookup_with_ttl("example.com.").is_some());
+}
+
+#[test]
+fn test_lookup_with_ttl_mixed_v4_v6() {
+    let mut cache = DnsCache::new();
+    let v4 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+    let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+    cache.insert("dual.example.com", &[(v4, 60), (v6, 120)]);
+
+    let results = cache.lookup_with_ttl("dual.example.com").unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].0, v4);
+    assert_eq!(results[1].0, v6);
+}
+
+#[test]
+fn test_lookup_with_ttl_returns_remaining_ttl() {
+    let mut cache = DnsCache::new();
+    let ip = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+    cache.insert("example.com", &[(ip, 300)]);
+
+    let results = cache.lookup_with_ttl("example.com").unwrap();
+    // The remaining TTL should be <= the original clamped TTL
+    // and > 0 since we just inserted it
+    assert!(results[0].1 > 0);
+    assert!(results[0].1 <= 300);
 }

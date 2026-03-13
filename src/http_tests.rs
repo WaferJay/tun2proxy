@@ -7,30 +7,19 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 /// Helper: create an `HttpConnection` with Basic auth, consume the initial CONNECT request,
 /// and return `(conn, shared_auth)`.
-async fn setup_conn_consume_first_request() -> (
-    HttpConnection,
-    Arc<Mutex<Option<Arc<dyn HttpAuthenticator>>>>,
-) {
+async fn setup_conn_consume_first_request() -> (HttpConnection, Arc<Mutex<Option<Arc<dyn HttpAuthenticator>>>>) {
     let src = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 12345);
     let dst = SocketAddr::new(Ipv4Addr::new(93, 184, 216, 34).into(), 443);
     let proxy_addr = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 8080);
     let info = SessionInfo::new(src, dst, IpProtocol::Tcp);
 
     let credentials = UserKey::new("testuser", "testpass");
-    let basic_auth: Arc<dyn HttpAuthenticator> =
-        Arc::new(BasicPasswordAuthenticator::new(credentials));
-    let shared_auth: Arc<Mutex<Option<Arc<dyn HttpAuthenticator>>>> =
-        Arc::new(Mutex::new(Some(basic_auth.clone())));
+    let basic_auth: Arc<dyn HttpAuthenticator> = Arc::new(BasicPasswordAuthenticator::new(credentials));
+    let shared_auth: Arc<Mutex<Option<Arc<dyn HttpAuthenticator>>>> = Arc::new(Mutex::new(Some(basic_auth.clone())));
 
-    let mut conn = HttpConnection::new(
-        proxy_addr,
-        info,
-        None,
-        Some(basic_auth),
-        shared_auth.clone(),
-    )
-    .await
-    .expect("HttpConnection::new should succeed");
+    let mut conn = HttpConnection::new(proxy_addr, info, None, Some(basic_auth), shared_auth.clone())
+        .await
+        .expect("HttpConnection::new should succeed");
 
     // Consume the initial CONNECT request so callers can feed responses directly.
     let len = conn.data_len(OutgoingDirection::ToServer);
@@ -47,28 +36,17 @@ async fn test_basic_to_digest_upgrade() {
     let info = SessionInfo::new(src, dst, IpProtocol::Tcp);
 
     let credentials = UserKey::new("testuser", "testpass");
-    let basic_auth: Arc<dyn HttpAuthenticator> =
-        Arc::new(BasicPasswordAuthenticator::new(credentials));
-    let shared_auth: Arc<Mutex<Option<Arc<dyn HttpAuthenticator>>>> =
-        Arc::new(Mutex::new(Some(basic_auth.clone())));
+    let basic_auth: Arc<dyn HttpAuthenticator> = Arc::new(BasicPasswordAuthenticator::new(credentials));
+    let shared_auth: Arc<Mutex<Option<Arc<dyn HttpAuthenticator>>>> = Arc::new(Mutex::new(Some(basic_auth.clone())));
 
-    let mut conn = HttpConnection::new(
-        proxy_addr,
-        info,
-        None,
-        Some(basic_auth),
-        shared_auth.clone(),
-    )
-    .await
-    .expect("HttpConnection::new should succeed");
+    let mut conn = HttpConnection::new(proxy_addr, info, None, Some(basic_auth), shared_auth.clone())
+        .await
+        .expect("HttpConnection::new should succeed");
 
     // ① + ② The constructor sends the first CONNECT request; verify it contains Basic auth.
     let event = conn.peek_data(OutgoingDirection::ToServer);
     let request = str::from_utf8(event.buffer).expect("request should be valid UTF-8");
-    assert!(
-        request.contains("CONNECT"),
-        "first request should be a CONNECT request"
-    );
+    assert!(request.contains("CONNECT"), "first request should be a CONNECT request");
     assert!(
         request.contains("Proxy-Authorization: Basic "),
         "first request should contain Basic auth header, got:\n{request}"
@@ -91,16 +69,10 @@ async fn test_basic_to_digest_upgrade() {
     .expect("push_data with 407 should succeed");
 
     // ⑤ The state machine should have generated a new CONNECT with Digest auth.
-    assert!(
-        !conn.connection_established(),
-        "should not be established after 407"
-    );
+    assert!(!conn.connection_established(), "should not be established after 407");
     let event = conn.peek_data(OutgoingDirection::ToServer);
     let request = str::from_utf8(event.buffer).expect("request should be valid UTF-8");
-    assert!(
-        request.contains("CONNECT"),
-        "second request should be a CONNECT request"
-    );
+    assert!(request.contains("CONNECT"), "second request should be a CONNECT request");
     assert!(
         request.contains("Proxy-Authorization: Digest "),
         "second request should contain Digest auth header, got:\n{request}"
@@ -124,10 +96,7 @@ async fn test_basic_to_digest_upgrade() {
     .expect("push_data with 200 should succeed");
 
     // ⑧ The tunnel should now be established.
-    assert!(
-        conn.connection_established(),
-        "connection should be established after 200"
-    );
+    assert!(conn.connection_established(), "connection should be established after 200");
 
     // ⑨ Verify data passthrough: server → client.
     let tunnel_data = b"Hello from server";
@@ -139,10 +108,7 @@ async fn test_basic_to_digest_upgrade() {
     .expect("push_data with tunnel data should succeed");
 
     let event = conn.peek_data(OutgoingDirection::ToClient);
-    assert_eq!(
-        event.buffer, tunnel_data,
-        "tunnel data should be forwarded to client"
-    );
+    assert_eq!(event.buffer, tunnel_data, "tunnel data should be forwarded to client");
 
     // ⑩ Verify shared_auth has been upgraded to DigestPasswordAuthenticator.
     let guard = shared_auth.lock().await;
@@ -180,10 +146,7 @@ async fn test_non_407_error_propagates() {
         err_msg.contains("403") && err_msg.contains("Forbidden"),
         "error should contain status code and reason, got: {err_msg}"
     );
-    assert!(
-        !conn.connection_established(),
-        "connection should not be established after 403"
-    );
+    assert!(!conn.connection_established(), "connection should not be established after 403");
 }
 
 #[tokio::test]
@@ -193,8 +156,7 @@ async fn test_non_407_error_without_auth() {
     let proxy_addr = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 8080);
     let info = SessionInfo::new(src, dst, IpProtocol::Tcp);
 
-    let shared_auth: Arc<Mutex<Option<Arc<dyn HttpAuthenticator>>>> =
-        Arc::new(Mutex::new(None));
+    let shared_auth: Arc<Mutex<Option<Arc<dyn HttpAuthenticator>>>> = Arc::new(Mutex::new(None));
 
     let mut conn = HttpConnection::new(proxy_addr, info, None, None, shared_auth)
         .await
@@ -249,8 +211,7 @@ async fn setup_bypass_conn() -> HttpConnection {
     let info = SessionInfo::new(src, dst, IpProtocol::Tcp);
 
     let auth: Arc<dyn HttpAuthenticator> = Arc::new(BypassAuthenticator);
-    let shared_auth: Arc<Mutex<Option<Arc<dyn HttpAuthenticator>>>> =
-        Arc::new(Mutex::new(Some(auth.clone())));
+    let shared_auth: Arc<Mutex<Option<Arc<dyn HttpAuthenticator>>>> = Arc::new(Mutex::new(Some(auth.clone())));
 
     let mut conn = HttpConnection::new(proxy_addr, info, None, Some(auth), shared_auth)
         .await
@@ -284,10 +245,7 @@ async fn test_bypass_sets_established_and_changes_server_addr() {
     .expect("push_data should succeed for bypass");
 
     // After bypass: connection should be established with server_addr changed to dst.
-    assert!(
-        conn.connection_established(),
-        "connection should be established after Bypass"
-    );
+    assert!(conn.connection_established(), "connection should be established after Bypass");
     assert_eq!(
         conn.get_server_addr(),
         dst,
@@ -353,10 +311,7 @@ async fn test_bypass_passthrough_after_established() {
     .expect("push_data with tunnel data should succeed");
 
     let event = conn.peek_data(OutgoingDirection::ToClient);
-    assert_eq!(
-        event.buffer, server_data,
-        "server data should be forwarded to client after bypass"
-    );
+    assert_eq!(event.buffer, server_data, "server data should be forwarded to client after bypass");
 
     let client_data = b"Hello from client";
     conn.push_data(IncomingDataEvent {
@@ -371,10 +326,7 @@ async fn test_bypass_passthrough_after_established() {
     conn.consume_data(OutgoingDirection::ToClient, len);
 
     let event = conn.peek_data(OutgoingDirection::ToServer);
-    assert_eq!(
-        event.buffer, client_data,
-        "client data should be forwarded to server after bypass"
-    );
+    assert_eq!(event.buffer, client_data, "client data should be forwarded to server after bypass");
 }
 
 #[tokio::test]
@@ -415,8 +367,7 @@ async fn test_bypass_on_non_407_status() {
     let info = SessionInfo::new(src, dst, IpProtocol::Tcp);
 
     let auth: Arc<dyn HttpAuthenticator> = Arc::new(BypassAuthenticator);
-    let shared_auth: Arc<Mutex<Option<Arc<dyn HttpAuthenticator>>>> =
-        Arc::new(Mutex::new(Some(auth.clone())));
+    let shared_auth: Arc<Mutex<Option<Arc<dyn HttpAuthenticator>>>> = Arc::new(Mutex::new(Some(auth.clone())));
 
     let mut conn = HttpConnection::new(proxy_addr, info, None, Some(auth), shared_auth)
         .await

@@ -64,26 +64,39 @@ impl DnsCache {
     pub fn lookup_ips(&self, domain: &str) -> Option<Vec<IpAddr>> {
         let domain = domain.trim_end_matches('.').to_ascii_lowercase();
         let now = Instant::now();
-        self.forward.get(&domain).map(|entry| {
-            entry
-                .ips
-                .iter()
-                .filter(|ci| now <= ci.expiry)
-                .map(|ci| ci.addr)
-                .collect()
-        }).and_then(|ips: Vec<IpAddr>| if ips.is_empty() { None } else { Some(ips) })
+        self.forward
+            .get(&domain)
+            .map(|entry| entry.ips.iter().filter(|ci| now <= ci.expiry).map(|ci| ci.addr).collect())
+            .and_then(|ips: Vec<IpAddr>| if ips.is_empty() { None } else { Some(ips) })
     }
 
     pub fn lookup_domains(&self, ip: &IpAddr) -> Option<Vec<&str>> {
         let now = Instant::now();
-        self.reverse.get(ip).map(|entries| {
-            entries
+        self.reverse
+            .get(ip)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .rev() // newest first (appended at end)
+                    .filter(|(_, expiry)| now <= *expiry)
+                    .map(|(domain, _)| domain.as_str())
+                    .collect()
+            })
+            .and_then(|domains: Vec<&str>| if domains.is_empty() { None } else { Some(domains) })
+    }
+
+    pub fn lookup_with_ttl(&self, domain: &str) -> Option<Vec<(IpAddr, u32)>> {
+        let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+        let now = Instant::now();
+        self.forward.get(&domain).and_then(|entry| {
+            let results: Vec<(IpAddr, u32)> = entry
+                .ips
                 .iter()
-                .rev() // newest first (appended at end)
-                .filter(|(_, expiry)| now <= *expiry)
-                .map(|(domain, _)| domain.as_str())
-                .collect()
-        }).and_then(|domains: Vec<&str>| if domains.is_empty() { None } else { Some(domains) })
+                .filter(|ci| now <= ci.expiry)
+                .map(|ci| (ci.addr, ci.expiry.duration_since(now).as_secs() as u32))
+                .collect();
+            if results.is_empty() { None } else { Some(results) }
+        })
     }
 
     pub fn evict_expired(&mut self) {
