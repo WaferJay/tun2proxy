@@ -1,7 +1,8 @@
 use crate::{
-    ProxyResult, SocketQueue,
+    dns, dns_mapping,
     proxy_handler::ProxyHandlerManager,
     session_info::{IpProtocol, SessionInfo},
+    socket_queue::SocketQueue,
 };
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::{
@@ -70,15 +71,15 @@ impl SharedDnsTcpClient {
         let proxy_handler = self.mgr.new_proxy_handler(info, None, false).await?;
 
         let server_addr = proxy_handler.lock().await.get_server_addr();
-        let mut server = crate::create_tcp_stream(&self.socket_queue, server_addr).await?;
+        let mut server = crate::socket_queue::create_tcp_stream(&self.socket_queue, server_addr).await?;
 
-        match crate::handle_proxy_session(&mut server, proxy_handler).await? {
-            ProxyResult::Established => {}
-            ProxyResult::Bypass(bypass_addr) => {
+        match crate::proxy_handler::handle_proxy_session(&mut server, proxy_handler).await? {
+            crate::proxy_handler::ProxyResult::Established => {}
+            crate::proxy_handler::ProxyResult::Bypass(bypass_addr) => {
                 let _ = server.shutdown().await;
-                server = crate::create_tcp_stream(&self.socket_queue, bypass_addr).await?;
+                server = crate::socket_queue::create_tcp_stream(&self.socket_queue, bypass_addr).await?;
             }
-            ProxyResult::UdpAssociate(_) => {
+            crate::proxy_handler::ProxyResult::UdpAssociate(_) => {
                 return Err("unexpected UDP associate in DNS-over-TCP".into());
             }
         }
@@ -200,4 +201,89 @@ impl SharedDnsTcpClient {
             }
         }
     }
+}
+
+/// Forward a DNS query through the shared TCP connection and write the response to the UDP stream.
+async fn forward_dns_over_tcp(
+    udp_stack: &mut ipstack::IpStackUdpStream,
+    query_data: &[u8],
+    shared_client: &SharedDnsTcpClient,
+    ipv6_enabled: bool,
+    dns_cache: &dns_mapping::SharedDnsCache,
+) {
+    let domain = match dns::parse_data_to_dns_message(query_data, false).and_then(|m| dns::extract_domain_from_dns_message(&m)) {
+        Ok(d) => d,
+        Err(e) => {
+            log::debug!("Failed to parse DNS query for TCP forwarding: {e}");
+            return;
+        }
+    };
+    log::trace!("DNS cache miss for {domain}, forwarding via shared TCP");
+    match shared_client.query(query_data).await {
+        Ok(response) => {
+            let resp_msg = match dns::parse_data_to_dns_message(&response, false) {
+                Ok(m) => m,
+                Err(e) => {
+                    log::debug!("Failed to parse DNS-over-TCP response: {e}");
+                    return;
+                }
+            };
+
+            // Snoop the response into cache.
+            let entries = dns::extract_ip_ttl_pairs_from_dns_message(&resp_msg);
+            if !entries.is_empty() {
+                dns_cache.lock().await.insert(&domain, &entries);
+            }
+
+            let mut resp_msg = resp_msg;
+            if !ipv6_enabled {
+                dns::remove_ipv6_entries(&mut resp_msg);
+            }
+
+            if let Ok(bytes) = resp_msg.to_vec() {
+                let _ = udp_stack.write_all(&bytes).await;
+            }
+        }
+        Err(e) => {
+            log::warn!("DNS-over-TCP query for {domain} failed: {e}");
+        }
+    }
+}
+
+pub(crate) async fn handle_dns_over_tcp_session(
+    mut udp_stack: ipstack::IpStackUdpStream,
+    shared_client: Arc<SharedDnsTcpClient>,
+    ipv6_enabled: bool,
+    dns_cache: dns_mapping::SharedDnsCache,
+    first_packet: Vec<u8>,
+) -> crate::Result<()> {
+    // Process the first packet (already checked for cache miss in the main loop).
+    forward_dns_over_tcp(&mut udp_stack, &first_packet, &shared_client, ipv6_enabled, &dns_cache).await;
+
+    let mut buf = [0u8; 4096];
+    loop {
+        let len = match udp_stack.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                log::debug!("DNS-over-TCP UDP read error: {e}");
+                break;
+            }
+        };
+        let query_data = &buf[..len];
+
+        // Check cache for subsequent queries.
+        match dns::try_respond_from_dns_cache(&mut udp_stack, query_data, ipv6_enabled, &dns_cache).await {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(e) => {
+                log::debug!("DNS cache check failed: {e}");
+                continue;
+            }
+        }
+
+        // Cache miss — forward through shared TCP connection.
+        forward_dns_over_tcp(&mut udp_stack, query_data, &shared_client, ipv6_enabled, &dns_cache).await;
+    }
+    Ok(())
 }

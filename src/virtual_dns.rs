@@ -4,7 +4,12 @@ use std::{
     collections::HashMap,
     convert::TryInto,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::Arc,
     time::{Duration, Instant},
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::Mutex,
 };
 use tproxy_config::IpCidr;
 
@@ -147,4 +152,25 @@ impl VirtualDns {
             }
         }
     }
+}
+
+pub(crate) async fn handle_virtual_dns_session(mut udp: ipstack::IpStackUdpStream, dns: Arc<Mutex<VirtualDns>>) -> Result<()> {
+    let mut buf = [0_u8; 4096];
+    loop {
+        let len = match udp.read(&mut buf).await {
+            Err(e) => {
+                // indicate UDP read fails not an error.
+                log::debug!("Virtual DNS session error: {e}");
+                break;
+            }
+            Ok(len) => len,
+        };
+        if len == 0 {
+            break;
+        }
+        let (msg, qname, ip) = dns.lock().await.generate_query(&buf[..len])?;
+        udp.write_all(&msg).await?;
+        log::debug!("Virtual DNS query: {qname} -> {ip}");
+    }
+    Ok(())
 }

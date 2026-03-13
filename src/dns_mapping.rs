@@ -157,6 +157,57 @@ impl BypassMatcher {
     }
 }
 
+pub(crate) async fn lookup_domain_name(
+    ip: &IpAddr,
+    virtual_dns: &Option<Arc<Mutex<crate::virtual_dns::VirtualDns>>>,
+    dns_cache: &SharedDnsCache,
+) -> Option<String> {
+    let domain_name = if let Some(virtual_dns) = virtual_dns {
+        let mut virtual_dns = virtual_dns.lock().await;
+        virtual_dns.touch_ip(ip);
+        virtual_dns.resolve_ip(ip).cloned()
+    } else {
+        None
+    };
+    match domain_name {
+        Some(name) => Some(name),
+        None => dns_cache
+            .lock()
+            .await
+            .lookup_domains(ip)
+            .and_then(|domains| domains.first().map(|s| s.to_string())),
+    }
+}
+
+/// Conservative bypass check: only bypass when ALL domains for an IP match.
+///
+/// Virtual DNS provides a 1:1 mapping (one fake IP per domain), so a single
+/// match is sufficient.  DNS cache, however, can map one IP to many domains
+/// (e.g. CDN shared IPs), so ALL associated domains must match.
+pub(crate) async fn check_bypass_ip(
+    ip: &IpAddr,
+    virtual_dns: &Option<Arc<Mutex<crate::virtual_dns::VirtualDns>>>,
+    dns_cache: &SharedDnsCache,
+    bypass_matcher: &BypassMatcher,
+) -> bool {
+    if bypass_matcher.is_empty() {
+        return false;
+    }
+
+    // Virtual DNS: 1:1 mapping, single domain is definitive.
+    if let Some(virtual_dns) = virtual_dns {
+        let mut virtual_dns = virtual_dns.lock().await;
+        if let Some(domain) = virtual_dns.resolve_ip(ip) {
+            return bypass_matcher.matches(domain);
+        }
+    }
+
+    // DNS cache: one IP may map to multiple domains.
+    // Conservative: only bypass when ALL associated domains match.
+    let cache = dns_cache.lock().await;
+    cache.lookup_domains(ip).is_some_and(|domains| bypass_matcher.matches_all(&domains))
+}
+
 #[cfg(test)]
 #[path = "dns_mapping_tests.rs"]
 mod tests;

@@ -1,7 +1,5 @@
 use super::*;
-use crate::directions::{IncomingDataEvent, OutgoingDataEvent, OutgoingDirection};
-use crate::proxy_handler::ProxyHandler;
-use crate::session_info::{IpProtocol, SessionInfo};
+use crate::session_info::IpProtocol;
 use std::net::Ipv4Addr;
 use tokio::net::TcpListener;
 

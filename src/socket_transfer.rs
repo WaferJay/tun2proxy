@@ -1,6 +1,9 @@
 #![cfg(target_os = "linux")]
 
-use crate::{SocketDomain, SocketProtocol, error};
+use crate::{
+    error,
+    socket_queue::{SocketDomain, SocketProtocol},
+};
 use nix::{
     errno::Errno,
     fcntl::{self, FdFlag},
