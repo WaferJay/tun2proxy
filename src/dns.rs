@@ -32,6 +32,19 @@ pub fn build_dns_response(mut request: Message, domain: &str, ip: IpAddr, ttl: u
     Ok(request)
 }
 
+pub fn build_dns_response_multi(mut request: Message, domain: &str, entries: &[(IpAddr, u32)]) -> Result<Message, String> {
+    let name = Name::from_str(domain).map_err(|e| e.to_string())?;
+    request.set_message_type(MessageType::Response);
+    for &(ip, ttl) in entries {
+        let record = match ip {
+            IpAddr::V4(v4) => Record::from_rdata(name.clone(), ttl, RData::A(A(v4))),
+            IpAddr::V6(v6) => Record::from_rdata(name.clone(), ttl, RData::AAAA(AAAA(v6))),
+        };
+        request.add_answer(record);
+    }
+    Ok(request)
+}
+
 pub fn remove_ipv6_entries(message: &mut Message) {
     message.answers_mut().retain(|answer| !matches!(answer.data(), RData::AAAA(_)));
 }

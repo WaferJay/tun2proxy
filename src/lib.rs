@@ -14,7 +14,6 @@ pub use socks5_impl::protocol::UserKey;
 #[cfg(feature = "udpgw")]
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::{
-    collections::VecDeque,
     io::ErrorKind,
     net::{IpAddr, SocketAddr},
     sync::Arc,
@@ -34,7 +33,7 @@ use udpgw::{UDPGW_KEEPALIVE_TIME, UDPGW_MAX_CONNECTIONS, UdpGwClientStream, UdpG
 pub use {
     args::{ArgDns, ArgProxy, ArgVerbosity, Args, ProxyType},
     error::{BoxError, Error, Result},
-    http::{HttpAuthenticator, HttpManager, PasswordAuthenticator, AuthResult},
+    http::{AuthResult, HttpAuthenticator, HttpManager, PasswordAuthenticator},
     proxy_handler::ProxyHandlerManager,
     traffic_status::{TrafficStatus, tun2proxy_set_traffic_status_callback},
 };
@@ -52,6 +51,7 @@ mod args;
 mod directions;
 mod dns;
 mod dns_mapping;
+mod dns_over_tcp;
 mod dump_logger;
 mod error;
 mod general_api;
@@ -71,7 +71,7 @@ pub mod win_svc;
 const DNS_PORT: u16 = 53;
 
 /// Result of a proxy handshake session.
-enum ProxyResult {
+pub(crate) enum ProxyResult {
     /// Proxy connection established normally.
     Established,
     /// Proxy indicated bypass; connect directly to this address instead.
@@ -143,7 +143,7 @@ impl SocketQueue {
     }
 }
 
-async fn create_tcp_stream(socket_queue: &Option<Arc<SocketQueue>>, peer: SocketAddr) -> std::io::Result<TcpStream> {
+pub(crate) async fn create_tcp_stream(socket_queue: &Option<Arc<SocketQueue>>, peer: SocketAddr) -> std::io::Result<TcpStream> {
     match &socket_queue {
         None => TcpStream::connect(peer).await,
         Some(queue) => queue.recv_tcp(peer.ip().into()).await?.connect(peer).await,
@@ -217,13 +217,11 @@ async fn lookup_domain_name(
     };
     match domain_name {
         Some(name) => Some(name),
-        None => {
-            dns_cache
-                .lock()
-                .await
-                .lookup_domains(ip)
-                .and_then(|domains| domains.first().map(|s| s.to_string()))
-        }
+        None => dns_cache
+            .lock()
+            .await
+            .lookup_domains(ip)
+            .and_then(|domains| domains.first().map(|s| s.to_string())),
     }
 }
 
@@ -253,9 +251,7 @@ async fn check_bypass_ip(
     // DNS cache: one IP may map to multiple domains.
     // Conservative: only bypass when ALL associated domains match.
     let cache = dns_cache.lock().await;
-    cache
-        .lookup_domains(ip)
-        .is_some_and(|domains| bypass_matcher.matches_all(&domains))
+    cache.lookup_domains(ip).is_some_and(|domains| bypass_matcher.matches_all(&domains))
 }
 
 /// When bypassing in Virtual DNS mode, resolve the fake IP to a real address.
@@ -284,11 +280,7 @@ async fn resolve_bypass_destination(
     true
 }
 
-async fn snoop_dns_response(
-    data: &[u8],
-    dns_cache: &dns_mapping::SharedDnsCache,
-    ipv6_enabled: bool,
-) -> crate::Result<Vec<u8>> {
+async fn snoop_dns_response(data: &[u8], dns_cache: &dns_mapping::SharedDnsCache, ipv6_enabled: bool) -> crate::Result<Vec<u8>> {
     let mut message = dns::parse_data_to_dns_message(data, false)?;
     if let Ok(name) = dns::extract_domain_from_dns_message(&message) {
         let entries = dns::extract_ip_ttl_pairs_from_dns_message(&message);
@@ -334,8 +326,7 @@ where
     };
 
     let bypass_matcher = dns_mapping::BypassMatcher::new(&args.bypass_domain);
-    let dns_cache: dns_mapping::SharedDnsCache =
-        Arc::new(Mutex::new(dns_mapping::DnsCache::new()));
+    let dns_cache: dns_mapping::SharedDnsCache = Arc::new(Mutex::new(dns_mapping::DnsCache::new()));
     let no_proxy_mgr: Arc<dyn ProxyHandlerManager> = Arc::new(NoProxyManager::new());
 
     // Periodically evict expired DNS cache entries.
@@ -412,9 +403,8 @@ where
                 ProxyType::Socks5 => Arc::new(SocksProxyManager::new(server_addr, V5, key)),
                 ProxyType::Socks4 => Arc::new(SocksProxyManager::new(server_addr, V4, key)),
                 ProxyType::Http => {
-                    let authenticator: Option<Arc<dyn HttpAuthenticator>> = key.map(|credentials| {
-                        Arc::new(PasswordAuthenticator::new(credentials)) as Arc<dyn HttpAuthenticator>
-                    });
+                    let authenticator: Option<Arc<dyn HttpAuthenticator>> =
+                        key.map(|credentials| Arc::new(PasswordAuthenticator::new(credentials)) as Arc<dyn HttpAuthenticator>);
                     Arc::new(HttpManager::new(server_addr, authenticator))
                 }
                 ProxyType::None => Arc::new(NoProxyManager::new()),
@@ -452,6 +442,16 @@ where
         client
     });
 
+    let shared_dns_tcp = if args.dns == ArgDns::OverTcp {
+        Some(Arc::new(dns_over_tcp::SharedDnsTcpClient::new(
+            mgr.clone(),
+            SocketAddr::new(dns_addr, DNS_PORT),
+            socket_queue.clone(),
+        )))
+    } else {
+        None
+    };
+
     let task_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     use std::sync::atomic::Ordering::Relaxed;
 
@@ -484,9 +484,9 @@ where
                 let mut should_bypass = check_bypass_ip(&tcp.peer_addr().ip(), &virtual_dns, &dns_cache, &bypass_matcher).await;
 
                 if should_bypass {
-                    should_bypass = resolve_bypass_destination(
-                        &mut info, &domain_name, virtual_dns.is_some(), dns_addr, &socket_queue, &dns_cache,
-                    ).await;
+                    should_bypass =
+                        resolve_bypass_destination(&mut info, &domain_name, virtual_dns.is_some(), dns_addr, &socket_queue, &dns_cache)
+                            .await;
                 }
 
                 let handler_mgr = if should_bypass { &no_proxy_mgr } else { &mgr };
@@ -515,12 +515,10 @@ where
                         info.dst.set_ip(dns_addr); // !!! Here we change the destination address to remote DNS server!!!
                     }
                     if args.dns == ArgDns::OverTcp {
-                        info.protocol = IpProtocol::Tcp;
-                        let proxy_handler = mgr.new_proxy_handler(info, None, false).await?;
-                        let socket_queue = socket_queue.clone();
+                        let shared_dns_tcp = shared_dns_tcp.clone().unwrap();
                         let dns_cache = dns_cache.clone();
                         tokio::spawn(async move {
-                            if let Err(err) = handle_dns_over_tcp_session(udp, proxy_handler, socket_queue, ipv6_enabled, dns_cache).await {
+                            if let Err(err) = handle_dns_over_tcp_session(udp, shared_dns_tcp, ipv6_enabled, dns_cache).await {
                                 log::error!("{info} error \"{err}\"");
                             }
                             log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
@@ -571,7 +569,9 @@ where
                                 Some(ref d) => socks5_impl::protocol::Address::from((d.clone(), dst.port())),
                                 None => dst.into(),
                             };
-                            if let Err(e) = handle_udp_gateway_session(udp, udpgw, &dst_addr, proxy_handler, queue, ipv6_enabled, dns_cache).await {
+                            if let Err(e) =
+                                handle_udp_gateway_session(udp, udpgw, &dst_addr, proxy_handler, queue, ipv6_enabled, dns_cache).await
+                            {
                                 log::info!("Ending {info} with \"{e}\"");
                             }
                             log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
@@ -581,9 +581,9 @@ where
                 }
 
                 if should_bypass {
-                    should_bypass = resolve_bypass_destination(
-                        &mut info, &domain_name, virtual_dns.is_some(), dns_addr, &socket_queue, &dns_cache,
-                    ).await;
+                    should_bypass =
+                        resolve_bypass_destination(&mut info, &domain_name, virtual_dns.is_some(), dns_addr, &socket_queue, &dns_cache)
+                            .await;
                 }
 
                 let handler_mgr = if should_bypass { &no_proxy_mgr } else { &mgr };
@@ -593,7 +593,9 @@ where
                     Ok(proxy_handler) => {
                         let socket_queue = socket_queue.clone();
                         tokio::spawn(async move {
-                            if let Err(err) = handle_udp_associate_session(udp, ty, proxy_handler, socket_queue, ipv6_enabled, dns_cache).await {
+                            if let Err(err) =
+                                handle_udp_associate_session(udp, ty, proxy_handler, socket_queue, ipv6_enabled, dns_cache).await
+                            {
                                 log::info!("Ending {info} with \"{err}\"");
                             }
                             log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
@@ -994,118 +996,89 @@ async fn handle_udp_associate_session(
 
 async fn handle_dns_over_tcp_session(
     mut udp_stack: IpStackUdpStream,
-    proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
-    socket_queue: Option<Arc<SocketQueue>>,
+    shared_client: Arc<dns_over_tcp::SharedDnsTcpClient>,
     ipv6_enabled: bool,
     dns_cache: dns_mapping::SharedDnsCache,
 ) -> crate::Result<()> {
-    let (session_info, server_addr) = {
-        let handler = proxy_handler.lock().await;
-
-        (handler.get_session_info(), handler.get_server_addr())
-    };
-
-    let mut server = create_tcp_stream(&socket_queue, server_addr).await?;
-
-    log::info!("Beginning {session_info}");
-
-    match handle_proxy_session(&mut server, proxy_handler).await? {
-        ProxyResult::Established => {}
-        ProxyResult::Bypass(bypass_addr) => {
-            let _ = server.shutdown().await;
-            log::info!("{session_info} bypassing proxy, connecting directly to {bypass_addr}");
-            server = create_tcp_stream(&socket_queue, bypass_addr).await?;
-        }
-        ProxyResult::UdpAssociate(_) => {
-            return Err("unexpected UDP associate response in DNS-over-TCP session".into());
-        }
-    }
-
-    let mut udp_recv_buf = [0u8; 4096];
-    let mut tcp_recv_buf = [0u8; 4096];
-    let mut tcp_pending = Vec::new();
+    let mut buf = [0u8; 4096];
     loop {
-        tokio::select! {
-            len = udp_stack.read(&mut udp_recv_buf) => {
-                let len = match len {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(e) => {
-                        log::debug!("{session_info} UDP read error: {e}, closing session");
-                        break;
-                    }
-                };
-                let udp_data = &udp_recv_buf[..len];
-
-                _ = dns::parse_data_to_dns_message(udp_data, false)?;
-
-                // Insert the DNS message length in front of the payload
-                let len = u16::try_from(udp_data.len())?;
-                let mut buf = Vec::with_capacity(std::mem::size_of::<u16>() + usize::from(len));
-                buf.extend_from_slice(&len.to_be_bytes());
-                buf.extend_from_slice(udp_data);
-
-                server.write_all(&buf).await?;
-
-                crate::traffic_status::traffic_status_update(buf.len(), 0)?;
+        let len = match udp_stack.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                log::debug!("DNS-over-TCP UDP read error: {e}");
+                break;
             }
-            len = server.read(&mut tcp_recv_buf) => {
-                let len = len?;
-                if len == 0 {
-                    break;
+        };
+        let query_data = &buf[..len];
+
+        // Parse the DNS query.
+        let message = match dns::parse_data_to_dns_message(query_data, false) {
+            Ok(m) => m,
+            Err(e) => {
+                log::debug!("Failed to parse DNS query: {e}");
+                continue;
+            }
+        };
+
+        let domain = match dns::extract_domain_from_dns_message(&message) {
+            Ok(d) => d,
+            Err(e) => {
+                log::debug!("Failed to extract domain from DNS query: {e}");
+                continue;
+            }
+        };
+
+        // Check cache first.
+        let cached = dns_cache.lock().await.lookup_ips_with_ttl(&domain);
+        if let Some(entries) = cached {
+            let filtered: Vec<(IpAddr, u32)> = if !ipv6_enabled {
+                entries.into_iter().filter(|(ip, _)| ip.is_ipv4()).collect()
+            } else {
+                entries
+            };
+
+            if !filtered.is_empty() {
+                log::trace!("DNS cache hit for {domain}, {} records", filtered.len());
+                let response = dns::build_dns_response_multi(message, &domain, &filtered)?;
+                udp_stack.write_all(&response.to_vec()?).await?;
+                continue;
+            }
+        }
+
+        // Cache miss — forward through shared TCP connection.
+        log::trace!("DNS cache miss for {domain}, forwarding via shared TCP");
+        match shared_client.query(query_data).await {
+            Ok(response) => {
+                let mut resp_msg = dns::parse_data_to_dns_message(&response, false)?;
+
+                // Snoop the response into cache.
+                let entries = dns::extract_ip_ttl_pairs_from_dns_message(&resp_msg);
+                if !entries.is_empty() {
+                    dns_cache.lock().await.insert(&domain, &entries);
                 }
-                tcp_pending.extend_from_slice(&tcp_recv_buf[..len]);
 
-                crate::traffic_status::traffic_status_update(0, len)?;
-
-                let mut to_send: VecDeque<Vec<u8>> = VecDeque::new();
-                while tcp_pending.len() >= 2 {
-                    let msg_len = u16::from_be_bytes([tcp_pending[0], tcp_pending[1]]) as usize;
-                    if tcp_pending.len() < msg_len + 2 {
-                        break;
-                    }
-
-                    // remove the length field
-                    let data = tcp_pending[2..msg_len + 2].to_vec();
-                    tcp_pending.drain(..msg_len + 2);
-
-                    let mut message = dns::parse_data_to_dns_message(&data, false)?;
-
-                    let name = dns::extract_domain_from_dns_message(&message)?;
-                    let ip = dns::extract_ipaddr_from_dns_message(&message);
-                    log::trace!("DNS over TCP query result: {name} -> {ip:?}");
-
-                    {
-                        let entries = dns::extract_ip_ttl_pairs_from_dns_message(&message);
-                        if !entries.is_empty() {
-                            dns_cache.lock().await.insert(&name, &entries);
-                        }
-                    }
-
-                    if !ipv6_enabled {
-                        dns::remove_ipv6_entries(&mut message);
-                    }
-
-                    to_send.push_back(message.to_vec()?);
+                if !ipv6_enabled {
+                    dns::remove_ipv6_entries(&mut resp_msg);
                 }
 
-                while let Some(packet) = to_send.pop_front() {
-                    udp_stack.write_all(&packet).await?;
-                }
+                udp_stack.write_all(&resp_msg.to_vec()?).await?;
+            }
+            Err(e) => {
+                log::warn!("DNS-over-TCP query for {domain} failed: {e}");
             }
         }
     }
-
-    let _ = server.shutdown().await;
-    log::info!("Ending {session_info}");
-
     Ok(())
 }
 
 /// This function is used to handle the business logic of tun2proxy and SOCKS5 server.
 /// When handling UDP proxy, the return value UDP associate IP address is the result of this business logic.
 /// However, when handling TCP business logic, the return value Ok(None) is meaningless, just indicating that the operation was successful.
-async fn handle_proxy_session(server: &mut TcpStream, proxy_handler: Arc<Mutex<dyn ProxyHandler>>) -> crate::Result<ProxyResult> {
+pub(crate) async fn handle_proxy_session(
+    server: &mut TcpStream,
+    proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
+) -> crate::Result<ProxyResult> {
     let mut launched = false;
     let mut proxy_handler = proxy_handler.lock().await;
     let dir = OutgoingDirection::ToServer;

@@ -308,8 +308,8 @@ fn test_wildcard_pattern_trailing_dot_trimmed() {
 #[test]
 fn test_mixed_suffix_and_wildcard() {
     let list = vec![
-        "github.com".to_string(),    // suffix
-        "*.google.*".to_string(),    // wildcard
+        "github.com".to_string(), // suffix
+        "*.google.*".to_string(), // wildcard
     ];
     let matcher = BypassMatcher::new(&list);
     // suffix path
@@ -329,6 +329,50 @@ fn test_bypass_is_empty() {
 
     let empty = BypassMatcher::new(&[]);
     assert!(empty.is_empty());
+}
+
+// --- lookup_ips_with_ttl tests ---
+
+#[test]
+fn test_lookup_ips_with_ttl_basic() {
+    let mut cache = DnsCache::new();
+    let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+    cache.insert("example.com", &[(ip, 300)]);
+
+    let results = cache.lookup_ips_with_ttl("example.com").unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0, ip);
+    // TTL should be close to 300 (within MIN_TTL..MAX_TTL range)
+    assert!(results[0].1 >= 298 && results[0].1 <= 300);
+}
+
+#[test]
+fn test_lookup_ips_with_ttl_missing() {
+    let cache = DnsCache::new();
+    assert!(cache.lookup_ips_with_ttl("nonexistent.com").is_none());
+}
+
+#[test]
+fn test_lookup_ips_with_ttl_normalizes() {
+    let mut cache = DnsCache::new();
+    let ip = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+    cache.insert("Example.COM.", &[(ip, 120)]);
+
+    assert!(cache.lookup_ips_with_ttl("example.com").is_some());
+    assert!(cache.lookup_ips_with_ttl("Example.COM.").is_some());
+}
+
+#[test]
+fn test_lookup_ips_with_ttl_multiple_ips() {
+    let mut cache = DnsCache::new();
+    let ip1 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+    let ip2 = IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8));
+    cache.insert("example.com", &[(ip1, 60), (ip2, 600)]);
+
+    let results = cache.lookup_ips_with_ttl("example.com").unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].0, ip1);
+    assert_eq!(results[1].0, ip2);
 }
 
 // --- matches_all tests ---

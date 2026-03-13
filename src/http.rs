@@ -6,9 +6,9 @@ use crate::{
 };
 use httparse::Response;
 use socks5_impl::protocol::UserKey;
-use std::{collections::VecDeque, net::SocketAddr, str, sync::Arc};
 use std::collections::HashMap;
 use std::hash::RandomState;
+use std::{collections::VecDeque, net::SocketAddr, str, sync::Arc};
 use tokio::sync::Mutex;
 use unicase::UniCase;
 
@@ -61,12 +61,8 @@ pub type PasswordAuthenticator = BasicPasswordAuthenticator;
 #[async_trait::async_trait]
 impl HttpAuthenticator for BasicPasswordAuthenticator {
     async fn generate_auth_headers(&self, _uri: &str) -> Result<Vec<(String, String)>> {
-        let auth_b64 =
-            base64easy::encode(self.credentials.to_string(), base64easy::EngineKind::Standard);
-        Ok(vec![(
-            PROXY_AUTHORIZATION.to_string(),
-            format!("Basic {auth_b64}"),
-        )])
+        let auth_b64 = base64easy::encode(self.credentials.to_string(), base64easy::EngineKind::Standard);
+        Ok(vec![(PROXY_AUTHORIZATION.to_string(), format!("Basic {auth_b64}"))])
     }
 
     async fn handle_failure(
@@ -123,10 +119,7 @@ impl HttpAuthenticator for DigestPasswordAuthenticator {
             .respond(&context)
             .map_err(|e| Error::from(e.to_string()))?;
 
-        Ok(vec![(
-            PROXY_AUTHORIZATION.to_string(),
-            response.to_header_string(),
-        )])
+        Ok(vec![(PROXY_AUTHORIZATION.to_string(), response.to_header_string())])
     }
 
     async fn handle_failure(
@@ -232,8 +225,7 @@ impl HttpConnection {
 
         if let Some(auth) = &self.authenticator {
             for (name, value) in auth.generate_auth_headers(&host).await? {
-                self.server_outbuf
-                    .extend(format!("{name}: {value}\r\n").as_bytes());
+                self.server_outbuf.extend(format!("{name}: {value}\r\n").as_bytes());
             }
         }
 
@@ -300,25 +292,18 @@ impl HttpConnection {
                 let auth = match &self.authenticator {
                     Some(a) => a.clone(),
                     None => {
-                        return Err(
-                            format!("HTTP {} [{}]", status_code, reason).into()
-                        );
+                        return Err(format!("HTTP {} [{}]", status_code, reason).into());
                     }
                 };
 
-                match auth
-                    .handle_failure(status_code, &headers_map, self.before)
-                    .await?
-                {
+                match auth.handle_failure(status_code, &headers_map, self.before).await? {
                     AuthResult::Retry => { /* use current authenticator */ }
                     AuthResult::RetryWith(new_auth) => {
                         self.authenticator = Some(new_auth.clone());
                         *self.shared_auth.lock().await = Some(new_auth);
                     }
                     AuthResult::Abort => {
-                        return Err(
-                            format!("HTTP {} [{}]", status_code, reason).into()
-                        );
+                        return Err(format!("HTTP {} [{}]", status_code, reason).into());
                     }
                     AuthResult::Bypass => {
                         self.server_inbuf.clear();
@@ -516,14 +501,7 @@ impl ProxyHandlerManager for HttpManager {
         }
         let authenticator = self.authenticator.lock().await.clone();
         Ok(Arc::new(Mutex::new(
-            HttpConnection::new(
-                self.server,
-                info,
-                domain_name,
-                authenticator,
-                self.authenticator.clone(),
-            )
-            .await?,
+            HttpConnection::new(self.server, info, domain_name, authenticator, self.authenticator.clone()).await?,
         )))
     }
 }

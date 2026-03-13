@@ -1,7 +1,10 @@
 use super::*;
 use hickory_proto::{
     op::{Message, MessageType, OpCode, Query},
-    rr::{Name, RData, Record, RecordType, rdata::{A, AAAA}},
+    rr::{
+        Name, RData, Record, RecordType,
+        rdata::{A, AAAA},
+    },
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
@@ -78,18 +81,12 @@ fn test_query_wire_format_question_section() {
     // Question section starts at offset 12
     // QNAME for "example.com": 7 e x a m p l e 3 c o m 0
     let expected_qname: &[u8] = &[
-        7, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
-        3, b'c', b'o', b'm',
-        0, // root label terminator
+        7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0, // root label terminator
     ];
     let qname_start = 12;
     let qname_end = qname_start + expected_qname.len();
     assert!(bytes.len() >= qname_end + 4, "message too short for question section");
-    assert_eq!(
-        &bytes[qname_start..qname_end],
-        expected_qname,
-        "QNAME encoding mismatch"
-    );
+    assert_eq!(&bytes[qname_start..qname_end], expected_qname, "QNAME encoding mismatch");
 
     // QTYPE = A (0x0001) immediately after QNAME
     let qtype = u16::from_be_bytes([bytes[qname_end], bytes[qname_end + 1]]);
@@ -107,11 +104,7 @@ fn test_query_wire_format_multi_level_domain() {
 
     // QNAME: 1 a 1 b 7 example 3 com 0
     let expected_qname: &[u8] = &[
-        1, b'a',
-        1, b'b',
-        7, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
-        3, b'c', b'o', b'm',
-        0,
+        1, b'a', 1, b'b', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
     ];
     assert_eq!(
         &bytes[12..12 + expected_qname.len()],
@@ -208,6 +201,56 @@ fn build_test_response_with_ttls(domain: &str, entries: &[(IpAddr, u32)]) -> Mes
         msg.add_answer(record);
     }
     msg
+}
+
+// ── build_dns_response_multi tests ─────────────────────────────────
+
+#[test]
+fn test_build_dns_response_multi_two_ips() {
+    let query_bytes = build_dns_query("example.com", 0x1111).unwrap();
+    let query_msg = parse_data_to_dns_message(&query_bytes, false).unwrap();
+
+    let ip1 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+    let ip2 = IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8));
+    let resp = build_dns_response_multi(query_msg, "example.com", &[(ip1, 60), (ip2, 120)]).unwrap();
+
+    assert_eq!(resp.id(), 0x1111);
+    assert_eq!(resp.message_type(), MessageType::Response);
+    assert_eq!(resp.answers().len(), 2);
+
+    let pairs = extract_ip_ttl_pairs_from_dns_message(&resp);
+    assert_eq!(pairs[0], (ip1, 60));
+    assert_eq!(pairs[1], (ip2, 120));
+}
+
+#[test]
+fn test_build_dns_response_multi_mixed_v4_v6() {
+    let query_bytes = build_dns_query("example.com", 0x2222).unwrap();
+    let query_msg = parse_data_to_dns_message(&query_bytes, false).unwrap();
+
+    let v4 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+    let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+    let resp = build_dns_response_multi(query_msg, "example.com", &[(v4, 100), (v6, 200)]).unwrap();
+
+    assert_eq!(resp.answers().len(), 2);
+    let pairs = extract_ip_ttl_pairs_from_dns_message(&resp);
+    assert_eq!(pairs[0], (v4, 100));
+    assert_eq!(pairs[1], (v6, 200));
+}
+
+#[test]
+fn test_build_dns_response_multi_roundtrip() {
+    let query_bytes = build_dns_query("test.com", 0x3333).unwrap();
+    let query_msg = parse_data_to_dns_message(&query_bytes, false).unwrap();
+
+    let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let resp = build_dns_response_multi(query_msg, "test.com", &[(ip, 300)]).unwrap();
+
+    // Serialize and re-parse
+    let bytes = resp.to_vec().unwrap();
+    let parsed = parse_data_to_dns_message(&bytes, false).unwrap();
+    assert_eq!(parsed.id(), 0x3333);
+    assert_eq!(extract_ipaddr_from_dns_message(&parsed).unwrap(), ip);
 }
 
 // ── extract_ip_ttl_pairs tests ──────────────────────────────────────

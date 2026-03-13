@@ -109,8 +109,7 @@ async fn tcp_pair() -> (TcpStream, TcpStream) {
 async fn test_proxy_result_established() {
     let (mut client, _server_side) = tcp_pair().await;
     let proxy_addr = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 8080);
-    let handler: Arc<Mutex<dyn ProxyHandler>> =
-        Arc::new(Mutex::new(MockHandler::established(proxy_addr, None)));
+    let handler: Arc<Mutex<dyn ProxyHandler>> = Arc::new(Mutex::new(MockHandler::established(proxy_addr, None)));
 
     let result = handle_proxy_session(&mut client, handler).await.unwrap();
     assert!(matches!(result, ProxyResult::Established));
@@ -121,8 +120,7 @@ async fn test_proxy_result_udp_associate() {
     let (mut client, _server_side) = tcp_pair().await;
     let proxy_addr = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 8080);
     let udp_addr = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 9090);
-    let handler: Arc<Mutex<dyn ProxyHandler>> =
-        Arc::new(Mutex::new(MockHandler::established(proxy_addr, Some(udp_addr))));
+    let handler: Arc<Mutex<dyn ProxyHandler>> = Arc::new(Mutex::new(MockHandler::established(proxy_addr, Some(udp_addr))));
 
     let result = handle_proxy_session(&mut client, handler).await.unwrap();
     if let ProxyResult::UdpAssociate(addr) = result {
@@ -137,8 +135,7 @@ async fn test_proxy_result_bypass() {
     let (mut client, mut server_side) = tcp_pair().await;
     let proxy_addr = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 8080);
     let bypass_addr = SocketAddr::new(Ipv4Addr::new(93, 184, 216, 34).into(), 443);
-    let handler: Arc<Mutex<dyn ProxyHandler>> =
-        Arc::new(Mutex::new(MockHandler::bypass(proxy_addr, bypass_addr)));
+    let handler: Arc<Mutex<dyn ProxyHandler>> = Arc::new(Mutex::new(MockHandler::bypass(proxy_addr, bypass_addr)));
 
     // The mock sends one dummy byte, then reads a response to trigger push_data.
     // Spawn a task to echo back so the handshake loop can proceed.
