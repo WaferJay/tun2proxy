@@ -601,3 +601,93 @@ fn test_bypass_fails_when_cname_from_doesnt_match() {
     // "evil.org" is a domain associated with this IP → does not match → no bypass
     assert!(!matcher.matches_all(&domains));
 }
+
+// --- Split-response CNAME chain tests ---
+
+#[test]
+fn test_cname_chain_split_responses_lookup_with_ttl() {
+    let mut cache = DnsCache::new();
+
+    // Response 1: m.baidu.com CNAME wap.n.shifen.com (no A record)
+    cache.insert(
+        "m.baidu.com",
+        &[DnsRecord::Cname("m.baidu.com".into(), "wap.n.shifen.com".into(), 300)],
+    );
+
+    // At this point, lookup should fail — no A record anywhere in the chain
+    assert!(cache.lookup_with_ttl("m.baidu.com").is_none());
+
+    // Response 2: wap.n.shifen.com A 1.2.3.4
+    cache.insert("wap.n.shifen.com", &[DnsRecord::A(Ipv4Addr::new(1, 2, 3, 4), 60)]);
+
+    // Now lookup_with_ttl should follow the chain and return CNAME + A
+    let results = cache.lookup_with_ttl("m.baidu.com").unwrap();
+    assert!(
+        results
+            .iter()
+            .any(|r| matches!(r, DnsRecord::Cname(from, to, _) if from == "m.baidu.com" && to == "wap.n.shifen.com"))
+    );
+    assert!(
+        results
+            .iter()
+            .any(|r| matches!(r, DnsRecord::A(addr, _) if *addr == Ipv4Addr::new(1, 2, 3, 4)))
+    );
+}
+
+#[test]
+fn test_cname_chain_split_responses_lookup_ips() {
+    let mut cache = DnsCache::new();
+
+    cache.insert(
+        "m.baidu.com",
+        &[DnsRecord::Cname("m.baidu.com".into(), "wap.n.shifen.com".into(), 300)],
+    );
+    assert!(cache.lookup_ips("m.baidu.com").is_none());
+
+    cache.insert("wap.n.shifen.com", &[DnsRecord::A(Ipv4Addr::new(1, 2, 3, 4), 60)]);
+
+    let ips = cache.lookup_ips("m.baidu.com").unwrap();
+    assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
+}
+
+#[test]
+fn test_cname_chain_split_responses_reverse_map() {
+    let mut cache = DnsCache::new();
+
+    // Insert CNAME first
+    cache.insert(
+        "m.baidu.com",
+        &[DnsRecord::Cname("m.baidu.com".into(), "wap.n.shifen.com".into(), 300)],
+    );
+
+    // Insert A record for target — reverse map should include m.baidu.com
+    cache.insert("wap.n.shifen.com", &[DnsRecord::A(Ipv4Addr::new(1, 2, 3, 4), 60)]);
+
+    let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+    let domains = cache.lookup_domains(&ip).unwrap();
+    assert!(domains.contains(&"wap.n.shifen.com"));
+    assert!(domains.contains(&"m.baidu.com"));
+}
+
+#[test]
+fn test_cname_chain_multi_level_split() {
+    let mut cache = DnsCache::new();
+
+    // a.com CNAME b.com
+    cache.insert("a.com", &[DnsRecord::Cname("a.com".into(), "b.com".into(), 300)]);
+    // b.com CNAME c.com
+    cache.insert("b.com", &[DnsRecord::Cname("b.com".into(), "c.com".into(), 300)]);
+    // c.com A 10.0.0.1
+    cache.insert("c.com", &[DnsRecord::A(Ipv4Addr::new(10, 0, 0, 1), 60)]);
+
+    // lookup_with_ttl("a.com") should follow: a.com -> b.com -> c.com -> A
+    let results = cache.lookup_with_ttl("a.com").unwrap();
+    let cnames: Vec<_> = results.iter().filter(|r| matches!(r, DnsRecord::Cname(..))).collect();
+    let ips: Vec<_> = results.iter().filter(|r| matches!(r, DnsRecord::A(..))).collect();
+    assert_eq!(cnames.len(), 2);
+    assert_eq!(ips.len(), 1);
+
+    // lookup_ips should also work
+    let ips = cache.lookup_ips("a.com").unwrap();
+    assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]);
+}

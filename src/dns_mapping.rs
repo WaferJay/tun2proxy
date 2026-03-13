@@ -9,6 +9,7 @@ use wildmatch::WildMatch;
 
 pub const MIN_TTL: Duration = Duration::from_secs(10);
 const MAX_TTL: Duration = Duration::from_secs(3600);
+const MAX_CNAME_CHAIN: usize = 8;
 
 /// DNS record type with TTL, used as input/output for the cache.
 #[derive(Debug, Clone, PartialEq)]
@@ -113,13 +114,94 @@ impl DnsCache {
             }
         }
 
+        // If this insert has A/AAAA records, also update reverse map for any
+        // existing CNAME entries that point to this domain (CNAME chain arriving
+        // in separate responses).
+        let has_ips = cached_entries
+            .iter()
+            .any(|e| matches!(e.record, CachedRecord::A(_) | CachedRecord::AAAA(_)));
+        if has_ips {
+            // Find all domains that have a CNAME pointing to `domain`
+            let referring_domains: Vec<String> = self
+                .forward
+                .iter()
+                .filter_map(|(d, fwd)| {
+                    let points_here = fwd.entries.iter().any(|e| {
+                        if let CachedRecord::Cname(_, to) = &e.record {
+                            *to == domain
+                        } else {
+                            false
+                        }
+                    });
+                    if points_here { Some(d.clone()) } else { None }
+                })
+                .collect();
+
+            if !referring_domains.is_empty() {
+                for entry in &cached_entries {
+                    let (ip, expiry) = match &entry.record {
+                        CachedRecord::A(addr) => (IpAddr::V4(*addr), entry.expiry),
+                        CachedRecord::AAAA(addr) => (IpAddr::V6(*addr), entry.expiry),
+                        CachedRecord::Cname(..) => continue,
+                    };
+                    let rev_entry = self.reverse.entry(ip).or_default();
+                    for rd in &referring_domains {
+                        rev_entry.retain(|(d, _)| d != rd);
+                        rev_entry.push((rd.clone(), expiry));
+                    }
+                }
+            }
+        }
+
         self.forward.insert(domain, ForwardEntry { entries: cached_entries });
+    }
+
+    /// Follow CNAME chain from `domain`, returning the final target domain and
+    /// all CNAME records along the way. Returns None if `domain` has no forward entry.
+    fn follow_cname_chain(&self, domain: &str, now: Instant) -> Option<(String, Vec<DnsRecord>)> {
+        let mut current = domain.to_owned();
+        let mut cname_records = Vec::new();
+        for _ in 0..MAX_CNAME_CHAIN {
+            let entry = self.forward.get(&current)?;
+            // Find a valid CNAME in this entry
+            let cname = entry
+                .entries
+                .iter()
+                .find(|e| now <= e.expiry && matches!(e.record, CachedRecord::Cname(..)));
+            if let Some(ce) = cname {
+                if let CachedRecord::Cname(from, to) = &ce.record {
+                    let remaining_ttl = ce.expiry.duration_since(now).as_secs() as u32;
+                    cname_records.push(DnsRecord::Cname(from.clone(), to.clone(), remaining_ttl));
+                    current = to.clone();
+                    continue;
+                }
+            }
+            // No more CNAMEs — current is the final target
+            return Some((current, cname_records));
+        }
+        // Chain too long, give up
+        None
     }
 
     pub fn lookup_ips(&self, domain: &str) -> Option<Vec<IpAddr>> {
         let domain = domain.trim_end_matches('.').to_ascii_lowercase();
         let now = Instant::now();
-        self.forward.get(&domain).and_then(|entry| {
+
+        // Try direct lookup first
+        if let Some(ips) = self.lookup_ips_direct(&domain, now) {
+            return Some(ips);
+        }
+
+        // Follow CNAME chain
+        let (target, _) = self.follow_cname_chain(&domain, now)?;
+        if target == domain {
+            return None;
+        }
+        self.lookup_ips_direct(&target, now)
+    }
+
+    fn lookup_ips_direct(&self, domain: &str, now: Instant) -> Option<Vec<IpAddr>> {
+        self.forward.get(domain).and_then(|entry| {
             let ips: Vec<IpAddr> = entry
                 .entries
                 .iter()
@@ -152,8 +234,42 @@ impl DnsCache {
     pub fn lookup_with_ttl(&self, domain: &str) -> Option<Vec<DnsRecord>> {
         let domain = domain.trim_end_matches('.').to_ascii_lowercase();
         let now = Instant::now();
-        self.forward.get(&domain).and_then(|entry| {
-            let results: Vec<DnsRecord> = entry
+
+        // Try direct lookup: if the entry has A/AAAA records, return them
+        if let Some(results) = self.lookup_with_ttl_direct(&domain, now) {
+            let has_ip = results.iter().any(|r| matches!(r, DnsRecord::A(..) | DnsRecord::AAAA(..)));
+            if has_ip {
+                return Some(results);
+            }
+        }
+
+        // Follow CNAME chain to find A/AAAA records at the end
+        let (target, cname_records) = self.follow_cname_chain(&domain, now)?;
+        if cname_records.is_empty() {
+            // No CNAME chain, and direct lookup already failed above
+            return None;
+        }
+
+        // Look up A/AAAA at the target
+        let target_records = self.lookup_with_ttl_direct(&target, now)?;
+        let target_ips: Vec<DnsRecord> = target_records
+            .into_iter()
+            .filter(|r| matches!(r, DnsRecord::A(..) | DnsRecord::AAAA(..)))
+            .collect();
+
+        if target_ips.is_empty() {
+            return None;
+        }
+
+        // Combine: CNAMEs first, then A/AAAA
+        let mut combined = cname_records;
+        combined.extend(target_ips);
+        Some(combined)
+    }
+
+    fn lookup_with_ttl_direct(&self, domain: &str, now: Instant) -> Option<Vec<DnsRecord>> {
+        self.forward.get(domain).map(|entry| {
+            entry
                 .entries
                 .iter()
                 .filter(|e| now <= e.expiry)
@@ -165,10 +281,7 @@ impl DnsCache {
                         CachedRecord::Cname(from, to) => DnsRecord::Cname(from.clone(), to.clone(), remaining_ttl),
                     }
                 })
-                .collect();
-            // Only return if there is at least one A/AAAA record (CNAME alone is useless)
-            let has_ip = results.iter().any(|r| matches!(r, DnsRecord::A(..) | DnsRecord::AAAA(..)));
-            if has_ip { Some(results) } else { None }
+                .collect()
         })
     }
 
@@ -176,11 +289,7 @@ impl DnsCache {
         let now = Instant::now();
         self.forward.retain(|_, entry| {
             entry.entries.retain(|e| now <= e.expiry);
-            // Keep entry if any A/AAAA records remain (CNAME alone is meaningless)
-            entry
-                .entries
-                .iter()
-                .any(|e| matches!(e.record, CachedRecord::A(_) | CachedRecord::AAAA(_)))
+            !entry.entries.is_empty()
         });
         self.reverse.retain(|_, entries| {
             entries.retain(|(_, expiry)| now <= *expiry);

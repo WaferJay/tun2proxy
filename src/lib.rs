@@ -196,10 +196,7 @@ async fn resolve_domain(
 
     // 3. Store results in cache
     let records = dns::extract_dns_records_from_message(&message);
-    if records
-        .iter()
-        .any(|r| matches!(r, dns_mapping::DnsRecord::A(..) | dns_mapping::DnsRecord::AAAA(..)))
-    {
+    if !records.is_empty() {
         dns_cache.lock().await.insert(domain, &records);
     }
 
@@ -287,10 +284,7 @@ async fn snoop_dns_response(data: &[u8], dns_cache: &dns_mapping::SharedDnsCache
     let mut message = dns::parse_data_to_dns_message(data, false)?;
     if let Ok(name) = dns::extract_domain_from_dns_message(&message) {
         let records = dns::extract_dns_records_from_message(&message);
-        if records
-            .iter()
-            .any(|r| matches!(r, dns_mapping::DnsRecord::A(..) | dns_mapping::DnsRecord::AAAA(..)))
-        {
+        if !records.is_empty() {
             dns_cache.lock().await.insert(&name, &records);
         }
     }
@@ -1113,12 +1107,14 @@ async fn handle_dns_over_tcp_session(
                     let mut message = dns::parse_data_to_dns_message(&data, false)?;
 
                     let name = dns::extract_domain_from_dns_message(&message)?;
-                    let ip = dns::extract_ipaddr_from_dns_message(&message);
-                    log::trace!("DNS over TCP query result: {name} -> {ip:?}");
 
                     {
                         let records = dns::extract_dns_records_from_message(&message);
-                        if records.iter().any(|r| matches!(r, dns_mapping::DnsRecord::A(..) | dns_mapping::DnsRecord::AAAA(..))) {
+                        log::trace!(
+                            "DNS over TCP: {name} answers: {:?}",
+                            message.answers().iter().collect::<Vec<_>>()
+                        );
+                        if !records.is_empty() {
                             dns_cache.lock().await.insert(&name, &records);
                         }
                     }
