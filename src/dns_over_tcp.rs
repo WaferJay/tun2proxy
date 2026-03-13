@@ -21,7 +21,7 @@ pub(crate) struct SharedDnsTcpClient {
     socket_queue: Option<Arc<SocketQueue>>,
 }
 
-type PendingMap = HashMap<u16, oneshot::Sender<crate::Result<Vec<u8>>>>;
+type PendingMap = HashMap<u16, Vec<oneshot::Sender<crate::Result<Vec<u8>>>>>;
 
 struct ClientInner {
     /// Pending queries keyed by DNS transaction ID.
@@ -60,8 +60,10 @@ impl SharedDnsTcpClient {
         // Clean up stale pending queries from a previous dead connection.
         {
             let mut pending = inner.pending.lock().await;
-            for (_, tx) in pending.drain() {
-                let _ = tx.send(Err("DNS TCP connection reset".into()));
+            for (_, senders) in pending.drain() {
+                for tx in senders {
+                    let _ = tx.send(Err("DNS TCP connection reset".into()));
+                }
             }
         }
 
@@ -96,8 +98,10 @@ impl SharedDnsTcpClient {
             }
             // Notify all remaining pending queries that the connection is gone.
             let mut pending = pending.lock().await;
-            for (_, tx) in pending.drain() {
-                let _ = tx.send(Err("DNS TCP connection closed".into()));
+            for (_, senders) in pending.drain() {
+                for tx in senders {
+                    let _ = tx.send(Err("DNS TCP connection closed".into()));
+                }
             }
         }));
 
@@ -129,8 +133,10 @@ impl SharedDnsTcpClient {
             let txn_id = u16::from_be_bytes([msg_buf[0], msg_buf[1]]);
 
             let mut pending = pending.lock().await;
-            if let Some(tx) = pending.remove(&txn_id) {
-                let _ = tx.send(Ok(msg_buf));
+            if let Some(senders) = pending.remove(&txn_id) {
+                for tx in senders {
+                    let _ = tx.send(Ok(msg_buf.clone()));
+                }
             } else {
                 log::debug!("DNS-over-TCP: no pending query for txn_id {txn_id:#06x}, dropping response");
             }
@@ -147,7 +153,7 @@ impl SharedDnsTcpClient {
         }
         let txn_id = u16::from_be_bytes([raw_query[0], raw_query[1]]);
 
-        let rx = {
+        let (rx, pending_ref) = {
             let mut inner = self.inner.lock().await;
 
             // Reconnect if needed.
@@ -157,32 +163,39 @@ impl SharedDnsTcpClient {
                 return Err(e);
             }
 
-            // Register the pending query.
+            // Keep a reference to the pending map for guaranteed cleanup on timeout.
+            let pending_ref = inner.pending.clone();
+
+            // Register the pending query.  If another session already has an
+            // in-flight query with the same txn_id (common: the OS resolver
+            // sends identical queries from different UDP source ports), we
+            // piggyback on it instead of sending a duplicate.
             let (tx, rx) = oneshot::channel();
-            {
+            let need_send = {
                 let mut pending = inner.pending.lock().await;
-                if pending.contains_key(&txn_id) {
-                    return Err(format!("DNS transaction ID collision: {txn_id:#06x}").into());
+                let first = !pending.contains_key(&txn_id);
+                pending.entry(txn_id).or_default().push(tx);
+                first
+            };
+
+            if need_send {
+                // Write the query with TCP framing.
+                let writer = inner.writer.as_mut().unwrap();
+                let len = u16::try_from(raw_query.len())?;
+                let mut frame = Vec::with_capacity(2 + raw_query.len());
+                frame.extend_from_slice(&len.to_be_bytes());
+                frame.extend_from_slice(raw_query);
+
+                if let Err(e) = writer.write_all(&frame).await {
+                    inner.pending.lock().await.remove(&txn_id);
+                    inner.writer = None;
+                    return Err(e.into());
                 }
-                pending.insert(txn_id, tx);
+
+                crate::traffic_status::traffic_status_update(frame.len(), 0)?;
             }
 
-            // Write the query with TCP framing.
-            let writer = inner.writer.as_mut().unwrap();
-            let len = u16::try_from(raw_query.len())?;
-            let mut frame = Vec::with_capacity(2 + raw_query.len());
-            frame.extend_from_slice(&len.to_be_bytes());
-            frame.extend_from_slice(raw_query);
-
-            if let Err(e) = writer.write_all(&frame).await {
-                inner.pending.lock().await.remove(&txn_id);
-                inner.writer = None;
-                return Err(e.into());
-            }
-
-            crate::traffic_status::traffic_status_update(frame.len(), 0)?;
-
-            rx
+            (rx, pending_ref)
             // inner mutex is dropped here — other tasks can send queries concurrently.
         };
 
@@ -191,12 +204,8 @@ impl SharedDnsTcpClient {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err("DNS TCP connection lost while waiting for response".into()),
             Err(_) => {
-                // Timeout — best-effort cleanup of the pending entry.
-                if let Ok(inner) = self.inner.try_lock() {
-                    if let Ok(mut pending) = inner.pending.try_lock() {
-                        pending.remove(&txn_id);
-                    }
-                }
+                // Guaranteed cleanup of the pending entry on timeout.
+                pending_ref.lock().await.remove(&txn_id);
                 Err("DNS query timed out".into())
             }
         }
@@ -287,3 +296,7 @@ pub(crate) async fn handle_dns_over_tcp_session(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "dns_over_tcp_tests.rs"]
+mod tests;
