@@ -4,7 +4,14 @@ use crate::{
     session_info::{IpProtocol, SessionInfo},
     socket_queue::SocketQueue,
 };
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::tcp::OwnedWriteHalf,
@@ -19,6 +26,8 @@ pub(crate) struct SharedDnsTcpClient {
     mgr: Arc<dyn ProxyHandlerManager>,
     dns_addr: SocketAddr,
     socket_queue: Option<Arc<SocketQueue>>,
+    /// Set when a query times out, forcing reconnection on the next query.
+    force_reconnect: AtomicBool,
 }
 
 type PendingMap = HashMap<u16, Vec<oneshot::Sender<crate::Result<Vec<u8>>>>>;
@@ -43,21 +52,30 @@ impl SharedDnsTcpClient {
             mgr,
             dns_addr,
             socket_queue,
+            force_reconnect: AtomicBool::new(false),
         }
     }
 
     /// Ensure a connection exists, creating one through the proxy if necessary.
     async fn ensure_connected(&self, inner: &mut ClientInner) -> crate::Result<()> {
-        let need_connect = !matches!(
-            (&inner.writer, &inner.reader_handle),
-            (Some(_), Some(handle)) if !handle.is_finished()
-        );
+        let need_connect = self.force_reconnect.swap(false, Ordering::Relaxed)
+            || !matches!(
+                (&inner.writer, &inner.reader_handle),
+                (Some(_), Some(handle)) if !handle.is_finished()
+            );
 
         if !need_connect {
             return Ok(());
         }
 
-        // Clean up stale pending queries from a previous dead connection.
+        // Abort the old reader task so its cleanup code doesn't drain pending
+        // entries that will belong to the new connection.
+        if let Some(handle) = inner.reader_handle.take() {
+            handle.abort();
+        }
+        inner.writer = None;
+
+        // Clean up stale pending queries from the previous dead connection.
         {
             let mut pending = inner.pending.lock().await;
             for (_, senders) in pending.drain() {
@@ -179,20 +197,31 @@ impl SharedDnsTcpClient {
             };
 
             if need_send {
-                // Write the query with TCP framing.
+                // Write the query with TCP framing (5s timeout to detect stuck connections).
                 let writer = inner.writer.as_mut().unwrap();
                 let len = u16::try_from(raw_query.len())?;
                 let mut frame = Vec::with_capacity(2 + raw_query.len());
                 frame.extend_from_slice(&len.to_be_bytes());
                 frame.extend_from_slice(raw_query);
 
-                if let Err(e) = writer.write_all(&frame).await {
-                    inner.pending.lock().await.remove(&txn_id);
-                    inner.writer = None;
-                    return Err(e.into());
+                match tokio::time::timeout(std::time::Duration::from_secs(5), writer.write_all(&frame)).await {
+                    Ok(Ok(())) => {
+                        crate::traffic_status::traffic_status_update(frame.len(), 0)?;
+                    }
+                    Ok(Err(e)) => {
+                        inner.pending.lock().await.remove(&txn_id);
+                        inner.writer = None;
+                        return Err(e.into());
+                    }
+                    Err(_) => {
+                        inner.pending.lock().await.remove(&txn_id);
+                        inner.writer = None;
+                        if let Some(handle) = inner.reader_handle.take() {
+                            handle.abort();
+                        }
+                        return Err("DNS TCP write timed out".into());
+                    }
                 }
-
-                crate::traffic_status::traffic_status_update(frame.len(), 0)?;
             }
 
             (rx, pending_ref)
@@ -204,8 +233,17 @@ impl SharedDnsTcpClient {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err("DNS TCP connection lost while waiting for response".into()),
             Err(_) => {
-                // Guaranteed cleanup of the pending entry on timeout.
-                pending_ref.lock().await.remove(&txn_id);
+                // Notify piggybacking senders with a proper error (instead of
+                // just dropping them, which produces a confusing "connection lost").
+                let mut pending = pending_ref.lock().await;
+                if let Some(senders) = pending.remove(&txn_id) {
+                    for tx in senders {
+                        let _ = tx.send(Err("DNS query timed out".into()));
+                    }
+                }
+                drop(pending);
+                // Force reconnect — the connection is likely dead.
+                self.force_reconnect.store(true, Ordering::Relaxed);
                 Err("DNS query timed out".into())
             }
         }

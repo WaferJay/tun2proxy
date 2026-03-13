@@ -250,14 +250,44 @@ async fn test_same_txn_id_concurrent_queries() {
 /// map. A subsequent query reusing the same transaction ID would then get a
 /// false "collision" error instead of proceeding normally.
 ///
-/// The fix clones the `Arc<Mutex<PendingMap>>` while the inner lock is held,
-/// then uses the direct reference for guaranteed cleanup on timeout.
+/// After a timeout the client now forces a reconnect, so the mock server must
+/// accept a second connection for the retry.
 #[tokio::test]
 async fn test_timeout_cleanup_allows_txn_id_reuse() {
     tokio::time::pause();
 
-    // Server: ignore the first query, echo back the second.
-    let (addr, _server) = start_mock_dns_server(1).await;
+    // Server: first connection reads one query but never responds (triggers timeout).
+    // After client reconnects, second connection echoes queries normally.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _server = tokio::spawn(async move {
+        // First connection: accept, read one query, never respond.
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut len_buf = [0u8; 2];
+        let _ = stream.read_exact(&mut len_buf).await;
+        let msg_len = u16::from_be_bytes(len_buf) as usize;
+        let mut msg = vec![0u8; msg_len];
+        let _ = stream.read_exact(&mut msg).await;
+        // Wait for client to close.
+        let mut buf = [0u8; 1];
+        let _ = stream.read(&mut buf).await;
+
+        // Second connection: echo all queries.
+        let (mut stream, _) = listener.accept().await.unwrap();
+        loop {
+            let mut len_buf = [0u8; 2];
+            if stream.read_exact(&mut len_buf).await.is_err() {
+                break;
+            }
+            let msg_len = u16::from_be_bytes(len_buf) as usize;
+            let mut msg = vec![0u8; msg_len];
+            if stream.read_exact(&mut msg).await.is_err() {
+                break;
+            }
+            let _ = stream.write_all(&len_buf).await;
+            let _ = stream.write_all(&msg).await;
+        }
+    });
 
     let mgr: Arc<dyn ProxyHandlerManager> = Arc::new(NoProxyManager::new());
     let client = SharedDnsTcpClient::new(mgr, addr, None);
@@ -270,9 +300,9 @@ async fn test_timeout_cleanup_allows_txn_id_reuse() {
         "first query should time out"
     );
 
-    // Second query with the SAME txn_id — must succeed, not get a false collision.
+    // Second query with the SAME txn_id — should reconnect and succeed.
     let result = client.query(&make_dns_msg(0x1234)).await;
-    assert!(result.is_ok(), "second query should succeed, not collide");
+    assert!(result.is_ok(), "second query should succeed after reconnect");
     assert_eq!(&result.unwrap()[0..2], &0x1234u16.to_be_bytes());
 }
 
