@@ -499,7 +499,7 @@ where
                     log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
                 });
             }
-            IpStackStream::Udp(udp) => {
+            IpStackStream::Udp(mut udp) => {
                 if task_count.load(Relaxed) >= max_sessions {
                     if args.exit_on_fatal_error {
                         log::info!("Too many sessions that over {max_sessions}, exiting...");
@@ -510,21 +510,12 @@ where
                 }
                 log::trace!("Session count {}", task_count.fetch_add(1, Relaxed).saturating_add(1));
                 let mut info = SessionInfo::new(udp.local_addr(), udp.peer_addr(), IpProtocol::Udp);
+                let mut dns_first_packet: Option<Vec<u8>> = None;
                 if info.dst.port() == DNS_PORT {
                     if is_private_ip(info.dst.ip()) {
                         info.dst.set_ip(dns_addr); // !!! Here we change the destination address to remote DNS server!!!
                     }
-                    if args.dns == ArgDns::OverTcp {
-                        let shared_dns_tcp = shared_dns_tcp.clone().unwrap();
-                        let dns_cache = dns_cache.clone();
-                        tokio::spawn(async move {
-                            if let Err(err) = handle_dns_over_tcp_session(udp, shared_dns_tcp, ipv6_enabled, dns_cache).await {
-                                log::error!("{info} error \"{err}\"");
-                            }
-                            log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
-                        });
-                        continue;
-                    }
+                    // Virtual DNS assigns fake IPs — skip cache check.
                     if args.dns == ArgDns::Virtual {
                         tokio::spawn(async move {
                             if let Some(virtual_dns) = virtual_dns {
@@ -536,12 +527,44 @@ where
                         });
                         continue;
                     }
+                    // Read the first DNS packet and try the cache.
+                    let mut first_buf = [0u8; 4096];
+                    let first_len = match udp.read(&mut first_buf).await {
+                        Ok(0) | Err(_) => {
+                            log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
+                            continue;
+                        }
+                        Ok(n) => n,
+                    };
+                    let first_packet = first_buf[..first_len].to_vec();
+                    if try_respond_from_dns_cache(&mut udp, &first_packet, ipv6_enabled, &dns_cache)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
+                        continue;
+                    }
+                    // Cache miss — dispatch to the appropriate handler with the first packet.
+                    if args.dns == ArgDns::OverTcp {
+                        let shared_dns_tcp = shared_dns_tcp.clone().unwrap();
+                        let dns_cache = dns_cache.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = handle_dns_over_tcp_session(udp, shared_dns_tcp, ipv6_enabled, dns_cache, first_packet).await
+                            {
+                                log::error!("{info} error \"{err}\"");
+                            }
+                            log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
+                        });
+                        continue;
+                    }
                     if args.dns == ArgDns::Direct {
                         let dns_dest = info.dst;
                         let socket_queue = socket_queue.clone();
                         let dns_cache = dns_cache.clone();
                         tokio::spawn(async move {
-                            if let Err(err) = handle_direct_dns_session(udp, dns_dest, socket_queue, ipv6_enabled, dns_cache).await {
+                            if let Err(err) =
+                                handle_direct_dns_session(udp, dns_dest, socket_queue, ipv6_enabled, dns_cache, first_packet).await
+                            {
                                 log::error!("{info} error \"{err}\"");
                             }
                             log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
@@ -549,6 +572,7 @@ where
                         continue;
                     }
                     // ArgDns::OverProxy falls through to general UDP handling below
+                    dns_first_packet = Some(first_packet);
                 }
                 let domain_name = lookup_domain_name(&udp.peer_addr().ip(), &virtual_dns, &dns_cache).await;
                 let mut should_bypass = check_bypass_ip(&udp.peer_addr().ip(), &virtual_dns, &dns_cache, &bypass_matcher).await;
@@ -563,14 +587,24 @@ where
                         let proxy_handler = mgr.new_proxy_handler(tcpinfo, None, false).await?;
                         let queue = socket_queue.clone();
                         let dns_cache = dns_cache.clone();
+                        let dns_first_packet = dns_first_packet.take();
                         tokio::spawn(async move {
                             let dst = info.dst; // real UDP destination address
                             let dst_addr = match domain_name {
                                 Some(ref d) => socks5_impl::protocol::Address::from((d.clone(), dst.port())),
                                 None => dst.into(),
                             };
-                            if let Err(e) =
-                                handle_udp_gateway_session(udp, udpgw, &dst_addr, proxy_handler, queue, ipv6_enabled, dns_cache).await
+                            if let Err(e) = handle_udp_gateway_session(
+                                udp,
+                                udpgw,
+                                &dst_addr,
+                                proxy_handler,
+                                queue,
+                                ipv6_enabled,
+                                dns_cache,
+                                dns_first_packet,
+                            )
+                            .await
                             {
                                 log::info!("Ending {info} with \"{e}\"");
                             }
@@ -593,8 +627,16 @@ where
                     Ok(proxy_handler) => {
                         let socket_queue = socket_queue.clone();
                         tokio::spawn(async move {
-                            if let Err(err) =
-                                handle_udp_associate_session(udp, ty, proxy_handler, socket_queue, ipv6_enabled, dns_cache).await
+                            if let Err(err) = handle_udp_associate_session(
+                                udp,
+                                ty,
+                                proxy_handler,
+                                socket_queue,
+                                ipv6_enabled,
+                                dns_cache,
+                                dns_first_packet,
+                            )
+                            .await
                             {
                                 log::info!("Ending {info} with \"{err}\"");
                             }
@@ -647,8 +689,13 @@ async fn handle_direct_dns_session(
     socket_queue: Option<Arc<SocketQueue>>,
     ipv6_enabled: bool,
     dns_cache: dns_mapping::SharedDnsCache,
+    first_packet: Vec<u8>,
 ) -> crate::Result<()> {
     let mut dns_server = create_udp_stream(&socket_queue, dns_addr).await?;
+
+    // Forward the first packet (already checked for cache miss in the main loop).
+    traffic_status::traffic_status_update(first_packet.len(), 0)?;
+    dns_server.write_all(&first_packet).await?;
 
     let mut buf1 = [0_u8; 4096];
     let mut buf2 = [0_u8; 4096];
@@ -660,6 +707,9 @@ async fn handle_direct_dns_session(
                     break;
                 }
                 traffic_status::traffic_status_update(len, 0)?;
+                if try_respond_from_dns_cache(&mut udp, &buf1[..len], ipv6_enabled, &dns_cache).await.unwrap_or(false) {
+                    continue;
+                }
                 dns_server.write_all(&buf1[..len]).await?;
             }
             len = dns_server.read(&mut buf2) => {
@@ -753,6 +803,7 @@ async fn handle_tcp_session(
 }
 
 #[cfg(feature = "udpgw")]
+#[allow(clippy::too_many_arguments)]
 async fn handle_udp_gateway_session(
     mut udp_stack: IpStackUdpStream,
     udpgw_client: Arc<UdpGwClient>,
@@ -761,6 +812,7 @@ async fn handle_udp_gateway_session(
     socket_queue: Option<Arc<SocketQueue>>,
     ipv6_enabled: bool,
     dns_cache: dns_mapping::SharedDnsCache,
+    dns_first_packet: Option<Vec<u8>>,
 ) -> crate::Result<()> {
     let proxy_server_addr = { proxy_handler.lock().await.get_server_addr() };
     let udp_mtu = udpgw_client.get_udp_mtu();
@@ -809,6 +861,33 @@ async fn handle_udp_gateway_session(
 
     let mut tmp_buf = vec![0; udp_mtu.into()];
 
+    // Forward the pre-read DNS first packet (already checked for cache miss in the main loop).
+    if let Some(first_packet) = dns_first_packet {
+        crate::traffic_status::traffic_status_update(first_packet.len(), 0)?;
+        let sn = stream.serial_number();
+        if let Err(e) = UdpGwClient::send_udpgw_packet(ipv6_enabled, &first_packet, udp_dst, sn, &mut writer).await {
+            log::info!(
+                "[UdpGw] Ending stream {} {} <> {} with send_udpgw_packet {}",
+                sn,
+                &tcp_local_addr,
+                udp_dst,
+                e
+            );
+            if !stream.is_closed() {
+                udpgw_client.store_server_connection_full(stream, reader, writer).await;
+            }
+            return Ok(());
+        }
+        log::debug!(
+            "[UdpGw] stream {} {} -> {} send first_packet len {}",
+            sn,
+            &tcp_local_addr,
+            udp_dst,
+            first_packet.len()
+        );
+        stream.update_activity();
+    }
+
     loop {
         tokio::select! {
             len = udp_stack.read(&mut tmp_buf) => {
@@ -824,6 +903,11 @@ async fn handle_udp_gateway_session(
                     }
                 };
                 crate::traffic_status::traffic_status_update(read_len, 0)?;
+                if udp_dst.port() == DNS_PORT
+                    && try_respond_from_dns_cache(&mut udp_stack, &tmp_buf[..read_len], ipv6_enabled, &dns_cache).await.unwrap_or(false)
+                {
+                    continue;
+                }
                 let sn = stream.serial_number();
                 if let Err(e) = UdpGwClient::send_udpgw_packet(ipv6_enabled, &tmp_buf[0..read_len], udp_dst, sn, &mut writer).await {
                     log::info!("[UdpGw] Ending stream {} {} <> {} with send_udpgw_packet {}", sn, &tcp_local_addr, udp_dst, e);
@@ -899,6 +983,7 @@ async fn handle_udp_associate_session(
     socket_queue: Option<Arc<SocketQueue>>,
     ipv6_enabled: bool,
     dns_cache: dns_mapping::SharedDnsCache,
+    dns_first_packet: Option<Vec<u8>>,
 ) -> crate::Result<()> {
     use socks5_impl::protocol::{Address, StreamOperation, UdpHeader};
 
@@ -932,6 +1017,24 @@ async fn handle_udp_associate_session(
 
     let mut udp_server = create_udp_stream(&socket_queue, udp_addr).await?;
 
+    // Forward the pre-read DNS first packet (already checked for cache miss in the main loop).
+    if let Some(first_packet) = dns_first_packet {
+        crate::traffic_status::traffic_status_update(first_packet.len(), 0)?;
+        if let ProxyType::Socks4 | ProxyType::Socks5 = proxy_type {
+            let s5addr = if let Some(domain_name) = &domain_name {
+                Address::DomainAddress(domain_name.clone().into(), session_info.dst.port())
+            } else {
+                session_info.dst.into()
+            };
+            let mut s5_udp_data = Vec::<u8>::new();
+            UdpHeader::new(0, s5addr).write_to_stream(&mut s5_udp_data)?;
+            s5_udp_data.extend_from_slice(&first_packet);
+            udp_server.write_all(&s5_udp_data).await?;
+        } else {
+            udp_server.write_all(&first_packet).await?;
+        }
+    }
+
     let mut buf1 = [0_u8; 4096];
     let mut buf2 = [0_u8; 4096];
     loop {
@@ -944,6 +1047,12 @@ async fn handle_udp_associate_session(
                 let buf1 = &buf1[..len];
 
                 crate::traffic_status::traffic_status_update(len, 0)?;
+
+                if session_info.dst.port() == DNS_PORT
+                    && try_respond_from_dns_cache(&mut udp_stack, buf1, ipv6_enabled, &dns_cache).await.unwrap_or(false)
+                {
+                    continue;
+                }
 
                 if let ProxyType::Socks4 | ProxyType::Socks5 = proxy_type {
                     let s5addr = if let Some(domain_name) = &domain_name {
@@ -994,12 +1103,90 @@ async fn handle_udp_associate_session(
     Ok(())
 }
 
+/// Try to answer a DNS query from cache. Returns `Ok(true)` if answered, `Ok(false)` on cache miss.
+async fn try_respond_from_dns_cache(
+    udp_stack: &mut IpStackUdpStream,
+    query_data: &[u8],
+    ipv6_enabled: bool,
+    dns_cache: &dns_mapping::SharedDnsCache,
+) -> crate::Result<bool> {
+    let message = dns::parse_data_to_dns_message(query_data, false)?;
+    let domain = dns::extract_domain_from_dns_message(&message)?;
+
+    let cached = dns_cache.lock().await.lookup_ips_with_ttl(&domain);
+    if let Some(entries) = cached {
+        let filtered: Vec<(IpAddr, u32)> = if !ipv6_enabled {
+            entries.into_iter().filter(|(ip, _)| ip.is_ipv4()).collect()
+        } else {
+            entries
+        };
+        if !filtered.is_empty() {
+            log::trace!("DNS cache hit for {domain}, {} records", filtered.len());
+            let response = dns::build_dns_response_multi(message, &domain, &filtered)?;
+            udp_stack.write_all(&response.to_vec()?).await?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Forward a DNS query through the shared TCP connection and write the response to the UDP stream.
+async fn forward_dns_over_tcp(
+    udp_stack: &mut IpStackUdpStream,
+    query_data: &[u8],
+    shared_client: &dns_over_tcp::SharedDnsTcpClient,
+    ipv6_enabled: bool,
+    dns_cache: &dns_mapping::SharedDnsCache,
+) {
+    let domain = match dns::parse_data_to_dns_message(query_data, false).and_then(|m| dns::extract_domain_from_dns_message(&m)) {
+        Ok(d) => d,
+        Err(e) => {
+            log::debug!("Failed to parse DNS query for TCP forwarding: {e}");
+            return;
+        }
+    };
+    log::trace!("DNS cache miss for {domain}, forwarding via shared TCP");
+    match shared_client.query(query_data).await {
+        Ok(response) => {
+            let resp_msg = match dns::parse_data_to_dns_message(&response, false) {
+                Ok(m) => m,
+                Err(e) => {
+                    log::debug!("Failed to parse DNS-over-TCP response: {e}");
+                    return;
+                }
+            };
+
+            // Snoop the response into cache.
+            let entries = dns::extract_ip_ttl_pairs_from_dns_message(&resp_msg);
+            if !entries.is_empty() {
+                dns_cache.lock().await.insert(&domain, &entries);
+            }
+
+            let mut resp_msg = resp_msg;
+            if !ipv6_enabled {
+                dns::remove_ipv6_entries(&mut resp_msg);
+            }
+
+            if let Ok(bytes) = resp_msg.to_vec() {
+                let _ = udp_stack.write_all(&bytes).await;
+            }
+        }
+        Err(e) => {
+            log::warn!("DNS-over-TCP query for {domain} failed: {e}");
+        }
+    }
+}
+
 async fn handle_dns_over_tcp_session(
     mut udp_stack: IpStackUdpStream,
     shared_client: Arc<dns_over_tcp::SharedDnsTcpClient>,
     ipv6_enabled: bool,
     dns_cache: dns_mapping::SharedDnsCache,
+    first_packet: Vec<u8>,
 ) -> crate::Result<()> {
+    // Process the first packet (already checked for cache miss in the main loop).
+    forward_dns_over_tcp(&mut udp_stack, &first_packet, &shared_client, ipv6_enabled, &dns_cache).await;
+
     let mut buf = [0u8; 4096];
     loop {
         let len = match udp_stack.read(&mut buf).await {
@@ -1012,62 +1199,18 @@ async fn handle_dns_over_tcp_session(
         };
         let query_data = &buf[..len];
 
-        // Parse the DNS query.
-        let message = match dns::parse_data_to_dns_message(query_data, false) {
-            Ok(m) => m,
+        // Check cache for subsequent queries.
+        match try_respond_from_dns_cache(&mut udp_stack, query_data, ipv6_enabled, &dns_cache).await {
+            Ok(true) => continue,
+            Ok(false) => {}
             Err(e) => {
-                log::debug!("Failed to parse DNS query: {e}");
-                continue;
-            }
-        };
-
-        let domain = match dns::extract_domain_from_dns_message(&message) {
-            Ok(d) => d,
-            Err(e) => {
-                log::debug!("Failed to extract domain from DNS query: {e}");
-                continue;
-            }
-        };
-
-        // Check cache first.
-        let cached = dns_cache.lock().await.lookup_ips_with_ttl(&domain);
-        if let Some(entries) = cached {
-            let filtered: Vec<(IpAddr, u32)> = if !ipv6_enabled {
-                entries.into_iter().filter(|(ip, _)| ip.is_ipv4()).collect()
-            } else {
-                entries
-            };
-
-            if !filtered.is_empty() {
-                log::trace!("DNS cache hit for {domain}, {} records", filtered.len());
-                let response = dns::build_dns_response_multi(message, &domain, &filtered)?;
-                udp_stack.write_all(&response.to_vec()?).await?;
+                log::debug!("DNS cache check failed: {e}");
                 continue;
             }
         }
 
         // Cache miss — forward through shared TCP connection.
-        log::trace!("DNS cache miss for {domain}, forwarding via shared TCP");
-        match shared_client.query(query_data).await {
-            Ok(response) => {
-                let mut resp_msg = dns::parse_data_to_dns_message(&response, false)?;
-
-                // Snoop the response into cache.
-                let entries = dns::extract_ip_ttl_pairs_from_dns_message(&resp_msg);
-                if !entries.is_empty() {
-                    dns_cache.lock().await.insert(&domain, &entries);
-                }
-
-                if !ipv6_enabled {
-                    dns::remove_ipv6_entries(&mut resp_msg);
-                }
-
-                udp_stack.write_all(&resp_msg.to_vec()?).await?;
-            }
-            Err(e) => {
-                log::warn!("DNS-over-TCP query for {domain} failed: {e}");
-            }
-        }
+        forward_dns_over_tcp(&mut udp_stack, query_data, &shared_client, ipv6_enabled, &dns_cache).await;
     }
     Ok(())
 }
