@@ -1,6 +1,7 @@
 use crate::{
     ArgVerbosity, Args,
     args::{ArgDns, ArgProxy},
+    dns_mapping,
     proxy_handler::ProxyHandlerManager,
 };
 use std::os::raw::{c_char, c_int, c_ushort};
@@ -261,6 +262,7 @@ pub async fn general_run_async(
             };
         }
     }
+    let bypass_matcher = dns_mapping::BypassMatcher::try_from(&args.bypass_domain)?;
 
     let join_handle = tokio::spawn(crate::run(
         device,
@@ -268,6 +270,7 @@ pub async fn general_run_async(
         args.clone(),
         shutdown_token.clone(),
         proxy_handler_manager,
+        bypass_matcher,
     ));
 
     match join_handle.await? {

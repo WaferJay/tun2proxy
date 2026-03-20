@@ -1,3 +1,4 @@
+use crate::Error;
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -298,9 +299,58 @@ impl DnsCache {
     }
 }
 
-enum BypassPattern {
-    Suffix(String),
+pub enum BypassPattern {
+    Fulltext(String),
     Wildcard(WildMatch),
+    FulltextWithPort((String, u16)),
+    WildcardWithPort((WildMatch, u16)),
+}
+
+impl std::fmt::Display for BypassPattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BypassPattern::Fulltext(domain) => {
+                write!(f, "{}", domain)
+            }
+            BypassPattern::Wildcard(wild_card) => {
+                write!(f, "{}", wild_card.to_string())
+            }
+            BypassPattern::FulltextWithPort((domain, port)) => {
+                write!(f, "{}:{}", domain, port)
+            }
+            BypassPattern::WildcardWithPort((wild_card, port)) => {
+                write!(f, "{}:{}", wild_card.to_string(), port)
+            }
+        }
+    }
+}
+
+impl TryFrom<&String> for BypassPattern {
+    type Error = Error;
+
+    fn try_from(s: &String) -> crate::Result<Self> {
+        if !s.contains(":") {
+            return if s.contains('*') || s.contains('?') {
+                Ok(Self::Wildcard(WildMatch::new(s)))
+            } else {
+                Ok(Self::Fulltext(s.to_string()))
+            };
+        }
+        let mut slice = s.splitn(2, ":");
+        let domain = slice.next().unwrap();
+        let mut port = 0;
+        if let Some(port_str) = slice.next() {
+            match port_str.parse::<u16>() {
+                Ok(p) => port = p,
+                Err(_) => return Err(Error::from(format!("Invalid port number for pattern '{s}'"))),
+            }
+        };
+        if s.contains('*') || s.contains('?') {
+            Ok(Self::WildcardWithPort((WildMatch::new(domain), port)))
+        } else {
+            Ok(Self::FulltextWithPort((s.to_string(), port)))
+        }
+    }
 }
 
 pub struct BypassMatcher {
@@ -308,19 +358,7 @@ pub struct BypassMatcher {
 }
 
 impl BypassMatcher {
-    pub fn new(bypass_list: &[String]) -> Self {
-        let patterns = bypass_list
-            .iter()
-            .map(|p| {
-                let p = p.trim_end_matches('.').to_ascii_lowercase();
-                if p.contains('*') || p.contains('?') {
-                    BypassPattern::Wildcard(WildMatch::new(&p))
-                } else {
-                    let p = p.trim_start_matches('.').to_owned();
-                    BypassPattern::Suffix(p)
-                }
-            })
-            .collect();
+    pub fn new(patterns: Vec<BypassPattern>) -> Self {
         Self { patterns }
     }
 
@@ -328,18 +366,32 @@ impl BypassMatcher {
         self.patterns.is_empty()
     }
 
-    pub fn matches(&self, domain: &str) -> bool {
+    pub fn matches(&self, domain: &str, port: u16) -> bool {
         let domain = domain.trim_end_matches('.').to_ascii_lowercase();
         self.patterns.iter().any(|pat| match pat {
-            BypassPattern::Suffix(s) => domain == *s || domain.ends_with(&format!(".{s}")),
+            BypassPattern::Fulltext(s) => domain == *s,
             BypassPattern::Wildcard(w) => w.matches(&domain),
+            BypassPattern::FulltextWithPort((s, p)) => domain == *s && port == *p,
+            BypassPattern::WildcardWithPort((w, p)) => w.matches(&domain) && port == *p,
         })
     }
 
     /// Returns true only when ALL the given domains match bypass patterns.
     /// Returns false if the list is empty (conservative: no domain info → no bypass).
-    pub fn matches_all(&self, domains: &[&str]) -> bool {
-        !domains.is_empty() && domains.iter().all(|d| self.matches(d))
+    pub fn matches_all(&self, domains: &[&str], port: u16) -> bool {
+        !domains.is_empty() && domains.iter().all(|d| self.matches(d, port))
+    }
+}
+
+impl TryFrom<&Vec<String>> for BypassMatcher {
+    type Error = Error;
+    fn try_from(s: &Vec<String>) -> crate::Result<Self> {
+        let mut list: Vec<BypassPattern> = Vec::with_capacity(s.len());
+        for e in s {
+            let pat = BypassPattern::try_from(e)?;
+            list.push(pat);
+        }
+        Ok(Self::new(list))
     }
 }
 

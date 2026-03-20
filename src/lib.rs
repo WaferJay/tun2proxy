@@ -43,6 +43,7 @@ pub use {
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+pub use dns_mapping::{BypassMatcher, BypassPattern};
 pub use general_api::general_run_async;
 
 pub const FORCE_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -230,8 +231,8 @@ async fn lookup_domain_name(
 /// Virtual DNS provides a 1:1 mapping (one fake IP per domain), so a single
 /// match is sufficient.  DNS cache, however, can map one IP to many domains
 /// (e.g. CDN shared IPs), so ALL associated domains must match.
-async fn check_bypass_ip(
-    ip: &IpAddr,
+async fn check_bypass_addr(
+    addr: &SocketAddr,
     virtual_dns: &Option<Arc<Mutex<VirtualDns>>>,
     dns_cache: &dns_mapping::SharedDnsCache,
     bypass_matcher: &dns_mapping::BypassMatcher,
@@ -243,15 +244,17 @@ async fn check_bypass_ip(
     // Virtual DNS: 1:1 mapping, single domain is definitive.
     if let Some(virtual_dns) = virtual_dns {
         let mut virtual_dns = virtual_dns.lock().await;
-        if let Some(domain) = virtual_dns.resolve_ip(ip) {
-            return bypass_matcher.matches(domain);
+        if let Some(domain) = virtual_dns.resolve_ip(&addr.ip()) {
+            return bypass_matcher.matches(domain, addr.port());
         }
     }
 
     // DNS cache: one IP may map to multiple domains.
     // Conservative: only bypass when ALL associated domains match.
     let cache = dns_cache.lock().await;
-    cache.lookup_domains(ip).is_some_and(|domains| bypass_matcher.matches_all(&domains))
+    cache
+        .lookup_domains(&addr.ip())
+        .is_some_and(|domains| bypass_matcher.matches_all(&domains, addr.port()))
 }
 
 /// When bypassing in Virtual DNS mode, resolve the fake IP to a real address.
@@ -308,6 +311,7 @@ pub async fn run<D>(
     args: Args,
     shutdown_token: CancellationToken,
     proxy_handler_manager: Option<Arc<dyn ProxyHandlerManager>>,
+    bypass_matcher: BypassMatcher,
 ) -> crate::Result<usize>
 where
     D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -325,7 +329,6 @@ where
         None
     };
 
-    let bypass_matcher = dns_mapping::BypassMatcher::new(&args.bypass_domain);
     let dns_cache: dns_mapping::SharedDnsCache = Arc::new(Mutex::new(dns_mapping::DnsCache::new()));
     let no_proxy_mgr: Arc<dyn ProxyHandlerManager> = Arc::new(NoProxyManager::new());
 
@@ -471,7 +474,7 @@ where
                 log::trace!("Session count {}", task_count.fetch_add(1, Relaxed).saturating_add(1));
                 let mut info = SessionInfo::new(tcp.local_addr(), tcp.peer_addr(), IpProtocol::Tcp);
                 let domain_name = lookup_domain_name(&tcp.peer_addr().ip(), &virtual_dns, &dns_cache).await;
-                let mut should_bypass = check_bypass_ip(&tcp.peer_addr().ip(), &virtual_dns, &dns_cache, &bypass_matcher).await;
+                let mut should_bypass = check_bypass_addr(&tcp.peer_addr(), &virtual_dns, &dns_cache, &bypass_matcher).await;
 
                 if should_bypass {
                     should_bypass =
@@ -543,7 +546,7 @@ where
                     // ArgDns::OverProxy falls through to general UDP handling below
                 }
                 let domain_name = lookup_domain_name(&udp.peer_addr().ip(), &virtual_dns, &dns_cache).await;
-                let mut should_bypass = check_bypass_ip(&udp.peer_addr().ip(), &virtual_dns, &dns_cache, &bypass_matcher).await;
+                let mut should_bypass = check_bypass_addr(&udp.peer_addr(), &virtual_dns, &dns_cache, &bypass_matcher).await;
                 #[cfg(feature = "udpgw")]
                 if let Some(udpgw) = udpgw_client.clone() {
                     if !should_bypass {
