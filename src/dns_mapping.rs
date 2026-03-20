@@ -313,13 +313,13 @@ impl std::fmt::Display for BypassPattern {
                 write!(f, "{}", domain)
             }
             BypassPattern::Wildcard(wild_card) => {
-                write!(f, "{}", wild_card.to_string())
+                write!(f, "{}", wild_card)
             }
             BypassPattern::FulltextWithPort((domain, port)) => {
                 write!(f, "{}:{}", domain, port)
             }
             BypassPattern::WildcardWithPort((wild_card, port)) => {
-                write!(f, "{}:{}", wild_card.to_string(), port)
+                write!(f, "{}:{}", wild_card, port)
             }
         }
     }
@@ -349,7 +349,7 @@ impl TryFrom<&String> for BypassPattern {
         if s.contains('*') || s.contains('?') {
             Ok(Self::WildcardWithPort((WildMatch::new(domain), port)))
         } else {
-            Ok(Self::FulltextWithPort((s.to_string(), port)))
+            Ok(Self::FulltextWithPort((domain.to_string(), port)))
         }
     }
 }

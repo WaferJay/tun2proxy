@@ -377,6 +377,16 @@ fn test_matches_all_single_domain() {
     assert!(!matcher.matches_all(&["other.com"], 443));
 }
 
+#[test]
+fn test_matches_domain_port() {
+    let matcher = BypassMatcher::try_from(&vec!["example.com:80".to_string()]).unwrap();
+    assert!(matcher.matches_all(&["example.com"], 80));
+    assert!(!matcher.matches_all(&["example.com"], 443));
+    let matcher = BypassMatcher::try_from(&vec!["*.example.com:80".to_string()]).unwrap();
+    assert!(matcher.matches_all(&["www.example.com"], 80));
+    assert!(!matcher.matches_all(&["www.example.com"], 443));
+}
+
 // --- lookup_with_ttl tests ---
 
 #[test]
