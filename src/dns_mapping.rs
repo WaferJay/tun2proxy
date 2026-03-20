@@ -329,6 +329,7 @@ impl TryFrom<&String> for BypassPattern {
     type Error = Error;
 
     fn try_from(s: &String) -> crate::Result<Self> {
+        let s = &s.trim().trim_start_matches(".").trim_end_matches(".").to_ascii_lowercase();
         if !s.contains(":") {
             return if s.contains('*') || s.contains('?') {
                 Ok(Self::Wildcard(WildMatch::new(s)))
@@ -337,7 +338,7 @@ impl TryFrom<&String> for BypassPattern {
             };
         }
         let mut slice = s.splitn(2, ":");
-        let domain = slice.next().unwrap();
+        let domain = slice.next().unwrap().trim_end_matches(".");
         let mut port = 0;
         if let Some(port_str) = slice.next() {
             match port_str.parse::<u16>() {
